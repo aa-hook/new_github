@@ -910,6 +910,27 @@ class CapMonsterFunCaptchaSolver:
                             pass
                 except Exception:
                     pass
+            try:
+                btns = p.locator('button').all()
+                for btn in btns:
+                    try:
+                        text = (btn.text_content() or '').strip().lower()
+                        aria = (btn.get_attribute('aria-label') or '').strip().lower()
+                        marker = f'{text} {aria}'
+                        is_verify = (
+                            'i am a human' in marker
+                            or 'verify' in marker
+                            or '验证' in marker
+                            or '我是人类' in marker
+                            or '人类' in marker
+                        )
+                        if is_verify and btn.is_visible():
+                            btn.click(force=True, timeout=2000)
+                            return True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             return False
 
         def recurse(p, depth):
@@ -1077,17 +1098,21 @@ class CapMonsterFunCaptchaSolver:
         else:
             logger.warning('⚠️ 无 blob (点击前后都没抓到)')
 
+        capmonster_blob_refreshed = False
         local_dice = try_solve_dice_challenge(page, image_catcher)
         if local_dice is True:
             logger.info('Local ONNX dice completed; checking parent page verdict')
-            post_local = _wait_post_local_dice_result(page, timeout=10.0)
+            post_local = _wait_post_local_dice_result(page, timeout=20.0)
             if post_local is True:
                 logger.info('Registration success detected after local dice')
                 return True
             if post_local is None:
-                logger.info('No rejection after local dice; hand off to registration success wait')
-                return True
-            logger.warning('Local dice did not produce usable parent token; trying CapMonster fallback')
+                if not self.config.api_key or blob_catcher is None:
+                    logger.info('No rejection after local dice and no CapMonster/blob catcher fallback available; hand off to registration success wait')
+                    return True
+                logger.warning('No final success/reject after local dice; refreshing for CapMonster fallback')
+            else:
+                logger.warning('Local dice did not produce usable parent token; trying CapMonster fallback')
             if not self.config.api_key:
                 logger.error('No CAPMONSTER_API_KEY; cannot retry rejected local dice with CapMonster')
                 return False
@@ -1103,9 +1128,26 @@ class CapMonsterFunCaptchaSolver:
                 logger.error('Could not obtain a fresh blob after rejected local dice; aborting CapMonster fallback')
                 return False
             blob = fresh_blob
+            capmonster_blob_refreshed = True
             local_dice = False
         if local_dice is False:
             logger.warning('Local ONNX dice failed/rejected; trying CapMonster fallback')
+            if not self.config.api_key:
+                logger.error('No CAPMONSTER_API_KEY; cannot retry failed local dice with CapMonster')
+                return False
+            if blob_catcher is not None and not capmonster_blob_refreshed:
+                fresh_blob = self._refresh_and_capture_fresh_blob_for_capmonster(
+                    page,
+                    blob_catcher=blob_catcher,
+                    old_blob=blob,
+                    detect_timeout=30.0,
+                    click_timeout=20.0,
+                    blob_timeout=20.0,
+                )
+                if not fresh_blob:
+                    logger.error('Could not obtain a fresh blob after failed local dice; aborting CapMonster fallback')
+                    return False
+                blob = fresh_blob
         else:
             logger.info('Non-dice challenge or local model unavailable; using CapMonster')
 
@@ -1419,6 +1461,8 @@ def main():
 
     ok = register_one(acc)
     logger.info(f'\n🏁 注册结束: {"✅ 成功" if ok else "❌ 失败"}')
+    if not ok:
+        sys.exit(1)
 
 
 if __name__ == '__main__':
