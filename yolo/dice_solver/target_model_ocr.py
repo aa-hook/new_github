@@ -20,6 +20,18 @@ DEFAULT_TARGET_MODEL = PACKAGE_ROOT / "models" / "target_classifier.onnx"
 TARGET_VALUES = list(range(5, 31))
 INPUT_WIDTH = 96
 INPUT_HEIGHT = 128
+_SESSION_CACHE = {}
+
+
+def _get_session(model_path: Path):
+    key = str(model_path.resolve())
+    sess = _SESSION_CACHE.get(key)
+    if sess is not None:
+        return sess
+    import onnxruntime as ort
+    sess = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+    _SESSION_CACHE[key] = sess
+    return sess
 
 
 def crop_target_from_image(image: Image.Image) -> Image.Image:
@@ -67,16 +79,13 @@ def predict_target_number(
         img = image.convert("RGB")
         image_name = None
 
-    try:
-        import onnxruntime as ort
-    except Exception as e:
-        return {"target": None, "status": "missing_onnxruntime", "error": f"{type(e).__name__}: {e}"}
-
     tensor = preprocess_target_image(img)
     try:
-        sess = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+        sess = _get_session(model_path)
         input_name = sess.get_inputs()[0].name
         output = sess.run(None, {input_name: tensor})[0]
+    except ImportError as e:
+        return {"target": None, "status": "missing_onnxruntime", "error": f"{type(e).__name__}: {e}"}
     except Exception as e:
         return {"target": None, "status": "inference_error", "error": f"{type(e).__name__}: {e}"}
 

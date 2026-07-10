@@ -28,6 +28,24 @@ from dice_solver.yolo_topface_infer import predict_strip_with_model
 
 DEFAULT_WEIGHTS = SCRIPT_DIR / "models" / "best.onnx"
 
+_YOLO_MODEL_CACHE: Dict[str, Any] = {}
+
+
+def _get_yolo_model(weights: Path, *, verbose: bool = False):
+    """Load YOLO once per process; register.py may call solve_image for every wave."""
+    key = str(weights.resolve())
+    model = _YOLO_MODEL_CACHE.get(key)
+    if model is not None:
+        return model
+    with quiet(not verbose):
+        from ultralytics import YOLO
+        try:
+            model = YOLO(str(weights), task="detect")
+        except TypeError:
+            model = YOLO(str(weights))
+    _YOLO_MODEL_CACHE[key] = model
+    return model
+
 
 def _maybe_rescue_target_from_classifier_top3(result: Dict[str, Any], ocr: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Recover Linux/template OCR mistakes when classifier top-3 matches one candidate sum.
@@ -156,13 +174,8 @@ def solve_image(
             "error": "target OCR failed",
         }
 
-    # Import/load YOLO inside quiet block; Ultralytics/ORT may print backend messages.
+    model = _get_yolo_model(weights, verbose=verbose)
     with quiet(not verbose):
-        from ultralytics import YOLO
-        try:
-            model = YOLO(str(weights), task="detect")
-        except TypeError:
-            model = YOLO(str(weights))
         result = predict_strip_with_model(
             model,
             image_path,

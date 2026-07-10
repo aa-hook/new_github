@@ -196,8 +196,47 @@ def _wait_registration_success(page, expected_email: Optional[str] = None, timeo
     while time.time() < deadline:
         if _is_registration_success(page, expected_email):
             return True
+        try:
+            state = _captcha_state(page)
+            if state == 'rejected':
+                logger.warning('Arkose value rejected while waiting registration success; stop waiting early')
+                return False
+        except Exception:
+            pass
         time.sleep(0.5)
     return False
+
+
+def _wait_post_local_dice_result(page, timeout: float = 10.0) -> Optional[bool]:
+    """After browser-side dice clicks, wait for the parent page verdict.
+
+    Local dice clicks can close the Arkose iframe while the parent form still
+    rejects the arkose value (for example: "Value is invalid").  Do not treat
+    iframe disappearance alone as final success; detect invalid/active gate fast
+    so the caller can fallback instead of wasting 45s on success-page wait.
+    """
+    deadline = time.time() + timeout
+    last_state = None
+    while time.time() < deadline:
+        if _is_registration_success(page):
+            return True
+        try:
+            state = _captcha_state(page)
+            last_state = state
+            if state == 'rejected':
+                sample = _captcha_text(page).replace('\n', ' ')[:220]
+                logger.warning(f'Local dice ended but parent page rejected/invalid: {sample}')
+                return False
+            if state == 'active':
+                text = _captcha_text(page).lower()
+                if 'i am a human' in text or 'value is invalid' in text or 'detecting humanity' in text:
+                    logger.warning('Local dice ended but page is still on humanity gate; fallback needed')
+                    return False
+        except Exception:
+            pass
+        time.sleep(0.4)
+    logger.info(f'No success/reject verdict {timeout:.0f}s after local dice, last_state={last_state}')
+    return None
 
 
 def _get_current_candidate_index(page) -> int:
@@ -428,6 +467,33 @@ def _extract_json_from_text(text: str):
     return None
 
 
+_LOCAL_DICE_SOLVE_IMAGE = None
+_LOCAL_DICE_IMPORT_ERROR = None
+
+
+def _load_local_dice_solve_image():
+    """Load yolo/solve.py once so each wave does not spawn/re-import a process."""
+    global _LOCAL_DICE_SOLVE_IMAGE, _LOCAL_DICE_IMPORT_ERROR
+    if _LOCAL_DICE_SOLVE_IMAGE is not None:
+        return _LOCAL_DICE_SOLVE_IMAGE
+    if _LOCAL_DICE_IMPORT_ERROR is not None:
+        raise _LOCAL_DICE_IMPORT_ERROR
+    try:
+        import importlib.util
+        if str(LOCAL_DICE_DIR) not in sys.path:
+            sys.path.insert(0, str(LOCAL_DICE_DIR))
+        spec = importlib.util.spec_from_file_location('local_dice_solve_module', str(LOCAL_DICE_SOLVER))
+        if spec is None or spec.loader is None:
+            raise ImportError(f'cannot load solver module: {LOCAL_DICE_SOLVER}')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _LOCAL_DICE_SOLVE_IMAGE = module.solve_image
+        return _LOCAL_DICE_SOLVE_IMAGE
+    except Exception as e:
+        _LOCAL_DICE_IMPORT_ERROR = e
+        raise
+
+
 def _run_local_dice_solver(image_path: Path) -> Dict[str, Any]:
     image_path = Path(image_path).resolve()
     if not LOCAL_DICE_SOLVER.exists():
@@ -435,7 +501,26 @@ def _run_local_dice_solver(image_path: Path) -> Dict[str, Any]:
     if not LOCAL_DICE_WEIGHTS.exists():
         return {'status': 'error', 'error': f'missing weights: {LOCAL_DICE_WEIGHTS}'}
     if not image_path.exists():
-        return {'status': 'error', 'error': f'image not found before subprocess: {image_path}'}
+        return {'status': 'error', 'error': f'image not found before inference: {image_path}'}
+
+    # Fast path: in-process solve with cached ONNX/YOLO sessions. Set
+    # LOCAL_DICE_SUBPROCESS=1 to force the old subprocess mode for debugging.
+    if os.environ.get('LOCAL_DICE_SUBPROCESS', '0').lower() not in ('1', 'true', 'yes'):
+        try:
+            solve_image = _load_local_dice_solve_image()
+            result = solve_image(
+                image_path,
+                weights=LOCAL_DICE_WEIGHTS,
+                conf=LOCAL_DICE_CONF,
+                device='cpu',
+                verbose=False,
+            )
+            result['returncode'] = 0 if result.get('status') == 'unique_match' and result.get('answer_index') is not None else 2
+            result['runner'] = 'inprocess'
+            return result
+        except Exception as e:
+            logger.warning(f'Local dice in-process solver failed, fallback to subprocess: {type(e).__name__}: {e}')
+
     cmd = [
         sys.executable,
         str(LOCAL_DICE_SOLVER),
@@ -453,6 +538,7 @@ def _run_local_dice_solver(image_path: Path) -> Dict[str, Any]:
     if not data:
         data = {'status': 'error', 'error': (p.stderr or p.stdout or '').strip()[:500], 'returncode': p.returncode}
     data['returncode'] = p.returncode
+    data['runner'] = 'subprocess'
     return data
 
 
@@ -522,7 +608,8 @@ def try_solve_dice_challenge(page, image_catcher) -> Optional[bool]:
         error = result.get('error')
         logger.info(
             f'🎲 ONNX 求解 wave={wave}: status={status}, target={target}, '
-            f'answer={answer}, error={error}, sums={result.get("candidate_sums")}'
+            f'answer={answer}, error={error}, runner={result.get("runner")}, '
+            f'sums={result.get("candidate_sums")}'
         )
 
         if status != 'unique_match' or answer is None:
@@ -842,6 +929,85 @@ class CapMonsterFunCaptchaSolver:
 
         return recurse(page, 0)
 
+    def _refresh_and_capture_fresh_blob_for_capmonster(self, page, blob_catcher, old_blob=None,
+                                                       detect_timeout=30.0, click_timeout=20.0,
+                                                       blob_timeout=20.0):
+        """Reload the gate while CDP is still listening, then return a fresh Arkose blob.
+
+        Used only after local browser-side dice clicks end in a parent-page
+        rejection (for example "Value is invalid"). The old blob belongs to
+        the rejected page/session, so it must be cleared before reload and must
+        never be passed to CapMonster.
+        """
+        if blob_catcher is None:
+            logger.error('Fresh blob retry requested but blob_catcher is not available')
+            return None
+
+        old_len = len(old_blob) if old_blob else 0
+        logger.warning(f'Refreshing page for CapMonster fallback with fresh Arkose blob (old_len={old_len})')
+
+        try:
+            blob_catcher.reset_blob()
+            logger.info('CDP blob catcher reset before reload; listener remains active')
+        except Exception as e:
+            logger.error(f'Failed to reset blob catcher before reload: {type(e).__name__}: {e}')
+            return None
+
+        try:
+            try:
+                page.reload(wait_until='domcontentloaded', timeout=20000)
+            except TypeError:
+                page.reload()
+            logger.info('Page reloaded; waiting for FunCaptcha to reappear')
+        except Exception as e:
+            logger.error(f'Page reload failed before fresh blob capture: {type(e).__name__}: {e}')
+            return None
+
+        detected = False
+        deadline = time.time() + detect_timeout
+        while time.time() < deadline:
+            try:
+                info = self.detect(page)
+                if info.get('found'):
+                    logger.info(f'FunCaptcha re-detected after refresh (siteKey={info.get("siteKey")})')
+                    detected = True
+                    break
+            except Exception as e:
+                logger.debug(f'Detect after refresh failed: {e}')
+            time.sleep(0.5)
+        if not detected:
+            logger.warning('FunCaptcha was not re-detected after refresh; still trying verify click/new blob wait')
+
+        clicked = False
+        click_deadline = time.time() + click_timeout
+        while time.time() < click_deadline:
+            try:
+                if self._click_arkose_verify_button(page):
+                    clicked = True
+                    logger.info('Clicked Arkose verify button after refresh')
+                    break
+            except Exception as e:
+                logger.debug(f'Verify click after refresh failed: {e}')
+            time.sleep(1.0)
+        if not clicked:
+            logger.warning('Verify button was not clicked after refresh; waiting for already-captured blob anyway')
+
+        try:
+            new_blob = blob_catcher.wait_for_blob(timeout=blob_timeout)
+        except Exception as e:
+            logger.error(f'Fresh blob wait failed: {type(e).__name__}: {e}')
+            return None
+
+        if not new_blob:
+            logger.error('Fresh blob retry failed: no new blob captured after refresh')
+            return None
+        if old_blob and new_blob == old_blob:
+            logger.error('Fresh blob retry captured the same blob as the rejected session; refusing to reuse it')
+            return None
+
+        logger.info(f'Fresh Arkose blob captured for CapMonster fallback (new_len={len(new_blob)}, old_len={old_len})')
+        return new_blob
+
     def inject_token(self, page, token):
         try:
             result = page.evaluate('''
@@ -913,15 +1079,38 @@ class CapMonsterFunCaptchaSolver:
 
         local_dice = try_solve_dice_challenge(page, image_catcher)
         if local_dice is True:
-            logger.info('🎲 本地 ONNX 骰子求解完成')
-            return True
+            logger.info('Local ONNX dice completed; checking parent page verdict')
+            post_local = _wait_post_local_dice_result(page, timeout=10.0)
+            if post_local is True:
+                logger.info('Registration success detected after local dice')
+                return True
+            if post_local is None:
+                logger.info('No rejection after local dice; hand off to registration success wait')
+                return True
+            logger.warning('Local dice did not produce usable parent token; trying CapMonster fallback')
+            if not self.config.api_key:
+                logger.error('No CAPMONSTER_API_KEY; cannot retry rejected local dice with CapMonster')
+                return False
+            fresh_blob = self._refresh_and_capture_fresh_blob_for_capmonster(
+                page,
+                blob_catcher=blob_catcher,
+                old_blob=blob,
+                detect_timeout=30.0,
+                click_timeout=20.0,
+                blob_timeout=20.0,
+            )
+            if not fresh_blob:
+                logger.error('Could not obtain a fresh blob after rejected local dice; aborting CapMonster fallback')
+                return False
+            blob = fresh_blob
+            local_dice = False
         if local_dice is False:
-            logger.warning('⚠️ 本地 ONNX 骰子求解失败，尝试 CapMonster 兜底')
+            logger.warning('Local ONNX dice failed/rejected; trying CapMonster fallback')
         else:
-            logger.info('ℹ️ 非骰子题或本地模型不可用，走 CapMonster')
+            logger.info('Non-dice challenge or local model unavailable; using CapMonster')
 
         if not self.config.api_key:
-            logger.error('❌ 无 CAPMONSTER_API_KEY，无法兜底求解非骰子/失败题型')
+            logger.error('No CAPMONSTER_API_KEY; cannot use CapMonster fallback')
             return False
 
         token = self.solve(page, blob=blob)
@@ -1188,8 +1377,14 @@ def register_one(acc):
             logger.info(f'💾 已保存: {acc["email"]}')
             page.screenshot(path='success.png')
             return True
-        except Exception:
-            logger.error(f'❌ 等待成功超时, URL={page.url[:100]}')
+        except Exception as e:
+            try:
+                final_state = _captcha_state(page)
+                sample = _captcha_text(page).replace('\n', ' ')[:220]
+            except Exception:
+                final_state = 'unknown'
+                sample = ''
+            logger.error(f'Registration success wait failed: {type(e).__name__}: {e}, captcha_state={final_state}, URL={page.url[:100]}, sample={sample}')
             page.screenshot(path='error_timeout.png')
             return False
 
