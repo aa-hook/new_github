@@ -25,6 +25,7 @@ class FakePage:
         self.events = events if events is not None else []
         self.frames = []
         self.main_frame = self
+        self.screenshots = []
 
     def reload(self, *args, **kwargs):
         self.events.append("reload")
@@ -32,6 +33,10 @@ class FakePage:
 
     def evaluate(self, *args, **kwargs):
         return "success"
+
+    def screenshot(self, path):
+        self.screenshots.append(str(path))
+        self.events.append(("screenshot", str(path)))
 
 
 class FakeBlobCatcher:
@@ -119,7 +124,7 @@ class FreshBlobRetryTests(unittest.TestCase):
 
             self.assertTrue(ok)
             self.assertEqual(page.reload_calls, 1)
-            self.assertEqual(blob_catcher.events[0], "reset_blob")
+            self.assertIn("reset_blob", blob_catcher.events)
             self.assertIn(("wait_for_blob", 20.0), blob_catcher.events)
             self.assertGreaterEqual(len(click_events), 2)
             self.assertEqual(solved_blobs, ["new_blob"])
@@ -217,6 +222,60 @@ class FreshBlobRetryTests(unittest.TestCase):
             self.assertEqual(page.reload_calls, 0)
             self.assertEqual(solved_blobs, ["initial_blob"])
             self.assertNotIn("reset_blob", events)
+        finally:
+            reg.CAPMONSTER_FIRST = original_capmonster_first
+            reg.try_solve_dice_challenge = original_try_solve
+
+    def test_capmonster_failure_falls_back_to_local_dice_when_available(self):
+        reg = load_register_module()
+        original_try_solve = reg.try_solve_dice_challenge
+        original_wait_post = reg._wait_post_local_dice_result
+        original_capmonster_first = getattr(reg, "CAPMONSTER_FIRST", False)
+        try:
+            reg.CAPMONSTER_FIRST = True
+            local_calls = []
+            reg.try_solve_dice_challenge = lambda page, image_catcher: local_calls.append(image_catcher) or True
+            reg._wait_post_local_dice_result = lambda page, timeout=20.0: True
+
+            solver = reg.CapMonsterFunCaptchaSolver(reg.CapMonsterSolverConfig(api_key="capmonster-key"))
+            events = []
+            page = FakePage(events)
+            blob_catcher = FakeBlobCatcher(events, old_blob="initial_blob", new_blob="unused")
+            image_catcher = object()
+
+            solver.detect = lambda p: {"found": True, "siteKey": "SITEKEY", "surl": "blizzard-api.arkoselabs.com"}
+            solver._click_arkose_verify_button = lambda p: True
+            solver.solve = lambda p, blob=None: None
+
+            ok = solver.solve_and_inject(page, timeout=5.0, blob_catcher=blob_catcher, image_catcher=image_catcher)
+
+            self.assertTrue(ok)
+            self.assertEqual(local_calls, [image_catcher])
+        finally:
+            reg.CAPMONSTER_FIRST = original_capmonster_first
+            reg.try_solve_dice_challenge = original_try_solve
+            reg._wait_post_local_dice_result = original_wait_post
+
+    def test_funcaptcha_detection_saves_debug_screenshot(self):
+        reg = load_register_module()
+        original_try_solve = reg.try_solve_dice_challenge
+        original_capmonster_first = getattr(reg, "CAPMONSTER_FIRST", False)
+        try:
+            reg.CAPMONSTER_FIRST = True
+            reg.try_solve_dice_challenge = lambda page, image_catcher: None
+            solver = reg.CapMonsterFunCaptchaSolver(reg.CapMonsterSolverConfig(api_key="capmonster-key"))
+            page = FakePage([])
+            blob_catcher = FakeBlobCatcher([])
+
+            solver.detect = lambda p: {"found": True, "siteKey": "SITEKEY", "surl": "blizzard-api.arkoselabs.com"}
+            solver._click_arkose_verify_button = lambda p: True
+            solver.solve = lambda p, blob=None: "capmonster-token"
+            solver.inject_token = lambda p, token: True
+
+            ok = solver.solve_and_inject(page, timeout=5.0, blob_catcher=blob_catcher, image_catcher=None)
+
+            self.assertTrue(ok)
+            self.assertTrue(any(path.endswith("funcaptcha_detected.png") for path in page.screenshots))
         finally:
             reg.CAPMONSTER_FIRST = original_capmonster_first
             reg.try_solve_dice_challenge = original_try_solve

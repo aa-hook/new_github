@@ -453,6 +453,22 @@ def _save_captcha_image_record(rec: Dict[str, Any], wave: int) -> Path:
     return path
 
 
+def _capture_debug_screenshot(page, filename: str) -> Optional[Path]:
+    """Best-effort screenshot for GitHub artifacts; never break registration flow."""
+    try:
+        CAPTCHA_SOLVE_DIR.mkdir(parents=True, exist_ok=True)
+        path = CAPTCHA_SOLVE_DIR / filename
+        try:
+            page.screenshot(path=str(path), full_page=True)
+        except TypeError:
+            page.screenshot(path=str(path))
+        logger.info(f'📸 已保存调试截图: {path}')
+        return path
+    except Exception as e:
+        logger.debug(f'Debug screenshot failed ({filename}): {type(e).__name__}: {e}')
+        return None
+
+
 def _is_dice_image(path: Path, page=None) -> bool:
     return _classify_captcha_image(path).get('kind') == 'dice'
 
@@ -1064,7 +1080,11 @@ class CapMonsterFunCaptchaSolver:
             try:
                 result = self.detect(page)
                 if pc % 10 == 0: logger.info(f'🔄 已探测 {pc} 次, found={result.get("found")}')
-                if result.get('found'): detected = True; logger.info(f'🎯 FunCaptcha 已检测到 (siteKey={result.get("siteKey")})'); break
+                if result.get('found'):
+                    detected = True
+                    logger.info(f'🎯 FunCaptcha 已检测到 (siteKey={result.get("siteKey")})')
+                    _capture_debug_screenshot(page, 'funcaptcha_detected.png')
+                    break
             except Exception as e: logger.warning(f'探测异常: {e}')
             time.sleep(0.5)
         if not detected: logger.warning('⏱️ 等待 FunCaptcha 超时 (正常)'); return True
@@ -1087,6 +1107,7 @@ class CapMonsterFunCaptchaSolver:
             page.reload(); time.sleep(5)
             if blob_catcher and not blob_before: blob_catcher.reset_blob()
             _try_click()
+        _capture_debug_screenshot(page, 'funcaptcha_after_verify.png')
 
         blob_new = None
         if blob_catcher is not None and not blob_before:
@@ -1162,7 +1183,24 @@ class CapMonsterFunCaptchaSolver:
             return False
 
         token = self.solve(page, blob=blob)
-        if not token: return False
+        if not token:
+            if LOCAL_DICE_ENABLED and image_catcher is not None:
+                logger.warning('CapMonster failed; trying local ONNX dice fallback if current challenge is dice')
+                local_after_capmonster = try_solve_dice_challenge(page, image_catcher)
+                if local_after_capmonster is True:
+                    post_local = _wait_post_local_dice_result(page, timeout=20.0)
+                    if post_local is True:
+                        logger.info('Registration success detected after CapMonster-failed local dice fallback')
+                        return True
+                    if post_local is None:
+                        logger.info('No rejection after CapMonster-failed local dice fallback; hand off to registration success wait')
+                        return True
+                    logger.warning('Local dice fallback after CapMonster failure was rejected')
+                elif local_after_capmonster is None:
+                    logger.warning('Local dice fallback skipped: current challenge is not dice or local solver unavailable')
+                else:
+                    logger.warning('Local dice fallback after CapMonster failure failed')
+            return False
         ok = self.inject_token(page, token)
 
         dl2 = time.time() + 15.0
