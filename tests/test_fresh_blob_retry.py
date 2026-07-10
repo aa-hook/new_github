@@ -189,6 +189,38 @@ class FreshBlobRetryTests(unittest.TestCase):
             reg.try_solve_dice_challenge = original_try_solve
             reg._wait_post_local_dice_result = original_wait_post
 
+    def test_capmonster_first_skips_local_dice_and_uses_initial_blob(self):
+        reg = load_register_module()
+        original_try_solve = reg.try_solve_dice_challenge
+        original_capmonster_first = getattr(reg, "CAPMONSTER_FIRST", False)
+        try:
+            reg.CAPMONSTER_FIRST = True
+
+            def fail_if_called(page, image_catcher):
+                raise AssertionError("local dice should be skipped in CAPMONSTER_FIRST mode")
+
+            reg.try_solve_dice_challenge = fail_if_called
+            solver = reg.CapMonsterFunCaptchaSolver(reg.CapMonsterSolverConfig(api_key="capmonster-key"))
+            events = []
+            page = FakePage(events)
+            blob_catcher = FakeBlobCatcher(events, old_blob="initial_blob", new_blob="unused")
+            solved_blobs = []
+
+            solver.detect = lambda p: {"found": True, "siteKey": "SITEKEY", "surl": "blizzard-api.arkoselabs.com"}
+            solver._click_arkose_verify_button = lambda p: True
+            solver.solve = lambda p, blob=None: solved_blobs.append(blob) or "capmonster-token"
+            solver.inject_token = lambda p, token: True
+
+            ok = solver.solve_and_inject(page, timeout=5.0, blob_catcher=blob_catcher, image_catcher=None)
+
+            self.assertTrue(ok)
+            self.assertEqual(page.reload_calls, 0)
+            self.assertEqual(solved_blobs, ["initial_blob"])
+            self.assertNotIn("reset_blob", events)
+        finally:
+            reg.CAPMONSTER_FIRST = original_capmonster_first
+            reg.try_solve_dice_challenge = original_try_solve
+
     def test_verify_click_falls_back_to_i_am_human_button_text(self):
         reg = load_register_module()
         solver = reg.CapMonsterFunCaptchaSolver(reg.CapMonsterSolverConfig(api_key="capmonster-key"))

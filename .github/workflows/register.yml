@@ -188,6 +188,10 @@ jobs:
             echo "CloakBrowser cache hit; skip install"
           fi
 
+      - name: Mask CapMonster key
+        if: ${{ github.event.inputs.capmonster_key != '' }}
+        run: echo "::add-mask::${{ github.event.inputs.capmonster_key }}"
+
       - name: Run register
         env:
           CAPMONSTER_API_KEY: ${{ github.event.inputs.capmonster_key }}

@@ -22,6 +22,8 @@ COUNTRY = 'GBR'
 BATTLE_TAG_BASE = 'Amireux'
 CDP_DEBUG_PORT = 9222
 CAPMONSTER_API_KEY = os.environ.get('CAPMONSTER_API_KEY', '')
+_CAPMONSTER_FIRST_DEFAULT = '1' if (os.environ.get('GITHUB_ACTIONS') and CAPMONSTER_API_KEY) else '0'
+CAPMONSTER_FIRST = os.environ.get('CAPMONSTER_FIRST', _CAPMONSTER_FIRST_DEFAULT).lower() not in ('0', 'false', 'no')
 LOCAL_DICE_ENABLED = os.environ.get('LOCAL_DICE_ENABLED', '1').lower() not in ('0', 'false', 'no')
 LOCAL_DICE_MAX_WAVES = int(os.environ.get('LOCAL_DICE_MAX_WAVES', '8'))
 LOCAL_DICE_CONF = float(os.environ.get('LOCAL_DICE_CONF', '0.25'))
@@ -1099,7 +1101,11 @@ class CapMonsterFunCaptchaSolver:
             logger.warning('⚠️ 无 blob (点击前后都没抓到)')
 
         capmonster_blob_refreshed = False
-        local_dice = try_solve_dice_challenge(page, image_catcher)
+        if CAPMONSTER_FIRST and self.config.api_key:
+            logger.info('CAPMONSTER_FIRST enabled; skip local ONNX dice and use captured fresh blob first')
+            local_dice = None
+        else:
+            local_dice = try_solve_dice_challenge(page, image_catcher)
         if local_dice is True:
             logger.info('Local ONNX dice completed; checking parent page verdict')
             post_local = _wait_post_local_dice_result(page, timeout=20.0)
