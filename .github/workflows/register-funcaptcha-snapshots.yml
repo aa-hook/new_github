@@ -1,0 +1,231 @@
+name: Battle.net FunCaptcha two-browser snapshots
+
+on:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: "parallel snapshot count (1-256)"
+        required: false
+        default: "1"
+      max_parallel:
+        description: "max parallel jobs"
+        required: false
+        default: "5"
+      captcha_image_wait:
+        description: "seconds to wait for Arkose challenge image before screenshot"
+        required: false
+        default: "75"
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      indices: ${{ steps.gen.outputs.indices }}
+      max_parallel: ${{ steps.gen.outputs.max_parallel }}
+    steps:
+      - name: Generate matrix
+        id: gen
+        run: |
+          N=${{ github.event.inputs.count }}
+          N=${N:-1}
+          if [ "$N" -gt 256 ]; then N=256; fi
+          P=${{ github.event.inputs.max_parallel }}
+          P=${P:-5}
+          if [ "$P" -gt 20 ]; then P=20; fi
+          indices=$(python3 -ESs -c 'import json,sys; n=int(sys.argv[1]); print(json.dumps(list(range(1, n+1))))' "$N")
+          echo "indices=$indices" >> $GITHUB_OUTPUT
+          echo "max_parallel=$P" >> $GITHUB_OUTPUT
+          echo "matrix size: $N, max_parallel: $P"
+
+  deps-cache:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache wheelhouse
+        id: wheelhouse
+        uses: actions/cache@v5
+        with:
+          path: .wheelhouse
+          key: wheelhouse-${{ runner.os }}-py312-${{ hashFiles('requirements.txt', 'yolo/requirements.txt') }}
+          restore-keys: |
+            wheelhouse-${{ runner.os }}-py312-
+
+      - name: Build wheelhouse
+        if: steps.wheelhouse.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          python -m pip install --upgrade pip
+          mkdir -p .wheelhouse
+          pip download -r requirements.txt -d .wheelhouse
+          echo "wheel count: $(find .wheelhouse -type f -name '*.whl' | wc -l)"
+
+      - name: Cache virtualenv
+        id: venv
+        uses: actions/cache@v5
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-py312-${{ hashFiles('requirements.txt', 'yolo/requirements.txt') }}
+          restore-keys: |
+            venv-${{ runner.os }}-py312-
+
+      - name: Build virtualenv
+        if: steps.venv.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          if [ -n "$(find .wheelhouse -type f -name '*.whl' -print -quit 2>/dev/null)" ]; then
+            .venv/bin/pip install --no-index --find-links .wheelhouse -r requirements.txt
+          else
+            .venv/bin/pip install -r requirements.txt
+          fi
+          .venv/bin/python - <<'PY'
+          import importlib.util
+          mods = ["cloakbrowser", "websocket", "requests"]
+          missing = [m for m in mods if importlib.util.find_spec(m) is None]
+          if missing:
+              raise SystemExit(f"missing modules: {missing}")
+          print("venv dependency check OK")
+          PY
+
+      - name: Cache CloakBrowser binary
+        id: cloak
+        uses: actions/cache@v5
+        with:
+          path: ~/.cloakbrowser
+          key: cloakbrowser-${{ runner.os }}-v2
+          restore-keys: |
+            cloakbrowser-${{ runner.os }}-
+
+      - name: Warm CloakBrowser binary
+        if: steps.cloak.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          .venv/bin/python -m cloakbrowser install
+
+  snapshot:
+    needs: [prepare, deps-cache]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(needs.prepare.outputs.max_parallel) }}
+      matrix:
+        index: ${{ fromJson(needs.prepare.outputs.indices) }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore virtualenv
+        id: venv
+        uses: actions/cache@v5
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-py312-${{ hashFiles('requirements.txt', 'yolo/requirements.txt') }}
+          restore-keys: |
+            venv-${{ runner.os }}-py312-
+
+      - name: Restore wheelhouse fallback
+        if: steps.venv.outputs.cache-hit != 'true'
+        uses: actions/cache@v5
+        with:
+          path: .wheelhouse
+          key: wheelhouse-${{ runner.os }}-py312-${{ hashFiles('requirements.txt', 'yolo/requirements.txt') }}
+          restore-keys: |
+            wheelhouse-${{ runner.os }}-py312-
+
+      - name: Restore CloakBrowser binary
+        uses: actions/cache@v5
+        with:
+          path: ~/.cloakbrowser
+          key: cloakbrowser-${{ runner.os }}-v2
+          restore-keys: |
+            cloakbrowser-${{ runner.os }}-
+
+      - name: Activate/install dependencies
+        env:
+          VENV_CACHE_HIT: ${{ steps.venv.outputs.cache-hit }}
+        run: |
+          set -e
+          if [ "$VENV_CACHE_HIT" != "true" ] || [ ! -x .venv/bin/python ]; then
+            echo "venv exact cache miss; installing/updating from wheelhouse/pip"
+            python -m venv .venv
+            .venv/bin/python -m pip install --upgrade pip
+            if [ -n "$(find .wheelhouse -type f -name '*.whl' -print -quit 2>/dev/null)" ]; then
+              .venv/bin/pip install --no-index --find-links .wheelhouse -r requirements.txt
+            else
+              .venv/bin/pip install -r requirements.txt
+            fi
+          else
+            echo "venv exact cache hit; skip pip install"
+          fi
+          echo "$PWD/.venv/bin" >> $GITHUB_PATH
+          .venv/bin/python -V
+          if [ ! -d "$HOME/.cloakbrowser" ] || [ -z "$(find "$HOME/.cloakbrowser" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+            echo "CloakBrowser cache miss; installing binary"
+            .venv/bin/python -m cloakbrowser install
+          else
+            echo "CloakBrowser cache hit; skip install"
+          fi
+
+      - name: Run two-browser FunCaptcha snapshot
+        env:
+          PYTHONUNBUFFERED: "1"
+          MATRIX_INDEX: "${{ matrix.index }}"
+          HEADLESS: "1"
+          CAPTCHA_IMAGE_WAIT: "${{ github.event.inputs.captcha_image_wait }}"
+          SNAPSHOT_OUTPUT_DIR: "funcaptcha_snapshot_debug"
+        run: python funcaptcha_two_browser_snapshots.py
+
+      - name: Upload two-browser screenshots/debug data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: funcaptcha-two-browser-snapshot-${{ matrix.index }}
+          path: |
+            funcaptcha_snapshot_debug/**
+            error_*.png
+          if-no-files-found: ignore
+
+  collect:
+    needs: snapshot
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download snapshot artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: funcaptcha-two-browser-snapshot-*
+          path: all_funcaptcha_snapshots
+          merge-multiple: false
+
+      - name: Repack snapshots
+        run: |
+          set -e
+          zip -r all-funcaptcha-two-browser-snapshots.zip all_funcaptcha_snapshots || true
+          find all_funcaptcha_snapshots -type f | sort | head -200 || true
+
+      - name: Upload combined snapshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-funcaptcha-two-browser-snapshots
+          path: all-funcaptcha-two-browser-snapshots.zip
+          if-no-files-found: ignore
