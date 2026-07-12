@@ -15,6 +15,14 @@ on:
         description: "seconds to wait for Arkose challenge image before screenshot"
         required: false
         default: "75"
+      artifact_mode:
+        description: "artifact output mode"
+        required: false
+        default: "solver_images"
+        type: choice
+        options:
+          - solver_images
+          - full_debug
 
 permissions:
   actions: write
@@ -195,8 +203,30 @@ jobs:
           SNAPSHOT_OUTPUT_DIR: "funcaptcha_snapshot_debug"
         run: python funcaptcha_two_browser_snapshots.py
 
+      - name: Collect solver captcha images only
+        if: ${{ always() && github.event.inputs.artifact_mode != 'full_debug' }}
+        env:
+          MATRIX_INDEX: "${{ matrix.index }}"
+        run: |
+          set -e
+          mkdir -p solver_captcha_images
+          find funcaptcha_snapshot_debug -type f \( -name 'solver_captcha_*.jpg' -o -name 'solver_captcha_*.jpeg' \) -print0 \
+            | while IFS= read -r -d '' f; do
+                cp "$f" "solver_captcha_images/$(basename "$f")"
+              done
+          echo "solver captcha images:"
+          find solver_captcha_images -type f | sort || true
+
+      - name: Upload solver captcha images
+        if: ${{ always() && github.event.inputs.artifact_mode != 'full_debug' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: funcaptcha-solver-captcha-${{ matrix.index }}
+          path: solver_captcha_images/*
+          if-no-files-found: ignore
+
       - name: Upload two-browser screenshots/debug data
-        if: always()
+        if: ${{ always() && github.event.inputs.artifact_mode == 'full_debug' }}
         uses: actions/upload-artifact@v4
         with:
           name: funcaptcha-two-browser-snapshot-${{ matrix.index }}
@@ -210,7 +240,33 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
+      - name: Download solver captcha artifacts
+        if: ${{ github.event.inputs.artifact_mode != 'full_debug' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: funcaptcha-solver-captcha-*
+          path: all_solver_captcha_images
+          merge-multiple: true
+
+      - name: Repack solver captcha images
+        if: ${{ github.event.inputs.artifact_mode != 'full_debug' }}
+        run: |
+          set -e
+          mkdir -p all_solver_captcha_images
+          zip -j all-funcaptcha-solver-captcha-images.zip all_solver_captcha_images/* || true
+          find all_solver_captcha_images -type f | sort || true
+
+      - name: Upload combined solver captcha images
+        if: ${{ github.event.inputs.artifact_mode != 'full_debug' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-funcaptcha-solver-captcha-images
+          path: all-funcaptcha-solver-captcha-images.zip
+          if-no-files-found: ignore
+
       - name: Download snapshot artifacts
+        if: ${{ github.event.inputs.artifact_mode == 'full_debug' }}
         uses: actions/download-artifact@v4
         with:
           pattern: funcaptcha-two-browser-snapshot-*
@@ -218,12 +274,14 @@ jobs:
           merge-multiple: false
 
       - name: Repack snapshots
+        if: ${{ github.event.inputs.artifact_mode == 'full_debug' }}
         run: |
           set -e
           zip -r all-funcaptcha-two-browser-snapshots.zip all_funcaptcha_snapshots || true
           find all_funcaptcha_snapshots -type f | sort | head -200 || true
 
       - name: Upload combined snapshots
+        if: ${{ github.event.inputs.artifact_mode == 'full_debug' }}
         uses: actions/upload-artifact@v4
         with:
           name: all-funcaptcha-two-browser-snapshots
