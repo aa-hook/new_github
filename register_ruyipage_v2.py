@@ -59,6 +59,15 @@ HUMAN_MOVE_MIN_MS = 1000
 HUMAN_MOVE_MAX_MS = 2000
 
 
+class ArkoseCompletionRejected(RuntimeError):
+    """Arkose fired onCompleted, but the payload marks the challenge as failed."""
+
+    def __init__(self, reason: str, payload: dict):
+        self.reason = reason
+        self.payload = dict(payload)
+        super().__init__(f"Arkose completion rejected: {reason}")
+
+
 def image_size(data: bytes) -> Optional[tuple[int, int]]:
     try:
         from PIL import Image
@@ -345,6 +354,14 @@ def solver_state(page) -> dict:
                   completed: !!cp.completed,
                   hasToken: !!cp.token,
                   tokenLength: cp.token ? String(cp.token).length : 0,
+                  suppressed: !!cp.suppressed,
+                  failed: !!cp.failed,
+                  error: cp.error == null ? null : String(cp.error),
+                  warning: cp.warning == null ? null : String(cp.warning),
+                  requested: cp.requested == null ? null : !!cp.requested,
+                  recoverable: !!cp.recoverable,
+                  width: cp.width == null ? null : Number(cp.width),
+                  height: cp.height == null ? null : Number(cp.height),
                   keys: Object.keys(cp).slice(0, 20)
                 } : null,
                 // 不返回 events：onShown payload 里也会带 token，避免落盘泄漏。
@@ -358,6 +375,17 @@ def solver_state(page) -> dict:
     return {}
 
 
+def completion_rejection_reason(payload: Optional[dict]) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("failed") is True:
+        return "failed=true"
+    error = payload.get("error")
+    if error:
+        return f"error={error}"
+    return None
+
+
 def wait_token_quick(page, timeout: float, prefix: str = "") -> Optional[str]:
     deadline = time.time() + timeout
     last_status = object()
@@ -366,6 +394,16 @@ def wait_token_quick(page, timeout: float, prefix: str = "") -> Optional[str]:
         if st.get("status") != last_status:
             LOG.info("%sSolver status: %s tokenLength=%s", prefix, st.get("status"), st.get("tokenLength") or 0)
             last_status = st.get("status")
+        completed_payload = st.get("completedPayload")
+        rejection_reason = completion_rejection_reason(completed_payload)
+        if rejection_reason:
+            LOG.warning(
+                "%sArkose onCompleted returned a rejected completion: %s payload=%s",
+                prefix,
+                rejection_reason,
+                completed_payload,
+            )
+            raise ArkoseCompletionRejected(rejection_reason, completed_payload)
         if st.get("token"):
             return str(st["token"])
         time.sleep(0.2)
@@ -1126,7 +1164,14 @@ def main() -> int:
         return 130
     except Exception as exc:
         LOG.error("Run failed: %s: %s", type(exc).__name__, exc, exc_info=True)
-        base.write_json(out / "summary.json", {"ok": False, "error": f"{type(exc).__name__}: {exc}", "outputDir": str(out.resolve())})
+        failure_summary = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "outputDir": str(out.resolve())}
+        if isinstance(exc, ArkoseCompletionRejected):
+            failure_summary["completedPayload"] = exc.payload
+            base.write_json(
+                out / "yescaptcha_solver_result.json",
+                {"ok": False, "error": str(exc), "completedPayload": exc.payload},
+            )
+        base.write_json(out / "summary.json", failure_summary)
         with contextlib.suppress(Exception):
             if page:
                 base.screenshot(page, out / "original_screenshots" / "error_original_page.png")

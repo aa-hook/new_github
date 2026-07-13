@@ -217,12 +217,28 @@ jobs:
           PYTHONUNBUFFERED: "1"
           MATRIX_INDEX: "${{ matrix.index }}"
         run: |
-          python register_ruyipage_v2.py \
-            --headless \
-            --network-mode 1 \
-            --click-style human \
-            --human-move-min-ms 800 \
-            --human-move-max-ms 1400
+          last_rc=1
+          for attempt in 1 2 3; do
+            echo "::group::Registration attempt ${attempt}/3"
+            if python register_ruyipage_v2.py \
+              --headless \
+              --network-mode 1 \
+              --click-style human \
+              --human-move-min-ms 800 \
+              --human-move-max-ms 1400; then
+              echo "::endgroup::"
+              echo "Registration succeeded on attempt ${attempt}/3"
+              exit 0
+            else
+              last_rc=$?
+              echo "Registration attempt ${attempt}/3 exited with ${last_rc}"
+              echo "::endgroup::"
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 5))
+            fi
+          done
+          exit "$last_rc"
 
       - name: Export successful account
         if: always()
