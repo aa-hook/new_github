@@ -131,3 +131,45 @@ def test_selected_bidi_headers_decodes_location_and_content_type():
         "location": "/creation/success",
         "content-type": "text/html",
     }
+
+
+def test_parse_captcha_gate_success_and_redact_ticket_tokens():
+    html = """
+    <i id="step-meta-data" data-step-id="create-success" data-step-has-errors="false"></i>
+    <i id="player-id" data-player-account-id="991268949"></i>
+    <p class="step__banner--account-identifier">user@example.com</p>
+    <a href="/login/ticket-login?ST=LOGIN_TICKET_SECRET&amp;STT=enc">Account</a>
+    """
+
+    outcome = app.parse_captcha_gate_response(html)
+    sanitized = app.sanitize_captcha_gate_response(html)
+
+    assert outcome == {
+        "stepId": "create-success",
+        "hasErrors": False,
+        "isCreateSuccess": True,
+        "playerAccountId": "991268949",
+        "accountEmail": "user@example.com",
+    }
+    assert "LOGIN_TICKET_SECRET" not in sanitized
+    assert "ST=<redacted>" in sanitized
+
+
+def test_captcha_gate_success_is_authoritative_when_email_matches():
+    records = [
+        {
+            "response": {
+                "status": 200,
+                "outcome": {
+                    "stepId": "create-success",
+                    "hasErrors": False,
+                    "isCreateSuccess": True,
+                    "playerAccountId": "991268949",
+                    "accountEmail": "user@example.com",
+                },
+            }
+        }
+    ]
+
+    assert app.captcha_gate_success(records, "user@example.com")["playerAccountId"] == "991268949"
+    assert app.captcha_gate_success(records, "different@example.com") is None

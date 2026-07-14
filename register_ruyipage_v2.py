@@ -14,6 +14,7 @@ import argparse
 import base64
 import contextlib
 import hashlib
+import html as html_lib
 import io
 import logging
 import os
@@ -449,6 +450,62 @@ def selected_bidi_headers(headers: Any) -> Dict[str, str]:
     return selected
 
 
+def sanitize_captcha_gate_response(body: str) -> str:
+    return re.sub(
+        r"(?i)(\bST=)[^&\"'<>\s]+",
+        r"\1<redacted>",
+        str(body or ""),
+    )
+
+
+def parse_captcha_gate_response(body: str) -> dict:
+    text = str(body or "")
+
+    def attr(name: str) -> Optional[str]:
+        match = re.search(rf'{re.escape(name)}=["\']([^"\']*)["\']', text, re.I)
+        return html_lib.unescape(match.group(1)).strip() if match else None
+
+    step_id = attr("data-step-id")
+    errors_text = attr("data-step-has-errors")
+    has_errors = None if errors_text is None else errors_text.lower() == "true"
+    player_account_id = attr("data-player-account-id")
+    email_match = re.search(
+        r'class=["\'][^"\']*step__banner--account-identifier[^"\']*["\'][^>]*>(.*?)</',
+        text,
+        re.I | re.S,
+    )
+    account_email = None
+    if email_match:
+        account_email = re.sub(r"<[^>]+>", "", email_match.group(1))
+        account_email = html_lib.unescape(account_email).strip()
+    return {
+        "stepId": step_id,
+        "hasErrors": has_errors,
+        "isCreateSuccess": step_id == "create-success" and has_errors is False,
+        "playerAccountId": player_account_id,
+        "accountEmail": account_email,
+    }
+
+
+def captcha_gate_success(records: Any, expected_email: Optional[str] = None) -> Optional[dict]:
+    expected = str(expected_email or "").strip().casefold()
+    for record in records or []:
+        response = (record or {}).get("response") or {}
+        status = int(response.get("status") or 0)
+        if not 200 <= status < 300:
+            continue
+        outcome = response.get("outcome")
+        if not isinstance(outcome, dict):
+            outcome = parse_captcha_gate_response(response.get("sample") or "")
+        if not outcome.get("isCreateSuccess"):
+            continue
+        actual = str(outcome.get("accountEmail") or "").strip().casefold()
+        if expected and actual and actual != expected:
+            continue
+        return dict(outcome)
+    return None
+
+
 def build_token_result(page: Any, token: str, actions: list[dict]) -> dict:
     state = solver_state(page)
     completed_payload = state.get("completedPayload")
@@ -561,7 +618,9 @@ class RuyiCaptchaGateCatcher:
         rec = self._record_for(request_id, url)
         request_body = self._collector_text(request_id, "request")
         response_body = self._collector_text(request_id, "response")
-        sample = re.sub(r"\s+", " ", response_body).strip()[:4000]
+        outcome = parse_captcha_gate_response(response_body)
+        sanitized_body = sanitize_captcha_gate_response(response_body)
+        sample = re.sub(r"\s+", " ", sanitized_body).strip()[:4000]
         with self._lock:
             if request_body:
                 rec["request"] = captcha_gate_request_metadata(request_body)
@@ -571,6 +630,7 @@ class RuyiCaptchaGateCatcher:
                 "headers": selected_bidi_headers(resp.get("headers")),
                 "bodyLength": len(response_body),
                 "sample": sample,
+                "outcome": outcome,
             }
         self._event.set()
         LOG.info(
@@ -1354,8 +1414,25 @@ def main() -> int:
         LOG.info("Original tab token injection result: %s", inject_result)
         base.screenshot(page, out / "original_screenshots" / "after_token_injection.png")
 
-        success = base.wait_registration_success(page, acc["email"], timeout=args.success_timeout)
-        reg_result = {"ok": bool(success), "email": acc["email"], "battleTag": acc["battle_tag"], "url": page.url}
+        gate_records = gate_catcher.wait(timeout=min(8.0, args.success_timeout)) if gate_catcher else []
+        base.write_json(out / "captcha_gate_records.json", gate_records)
+        gate_outcome = captcha_gate_success(gate_records, acc["email"])
+        if gate_outcome:
+            success = True
+            success_source = "captcha-gate-response"
+            LOG.info("captcha-gate confirmed create-success: %s", gate_outcome)
+        else:
+            success = base.wait_registration_success(page, acc["email"], timeout=args.success_timeout)
+            success_source = "page-dom" if success else None
+        reg_result = {
+            "ok": bool(success),
+            "email": acc["email"],
+            "battleTag": acc["battle_tag"],
+            "url": page.url,
+            "successSource": success_source,
+        }
+        if gate_outcome:
+            reg_result["captchaGateOutcome"] = gate_outcome
         if success:
             base.screenshot(page, out / "original_screenshots" / "registration_success.png")
             LOG.info("注册成功；YesCaptcha 分类 token 已被原注册标签接受")
@@ -1365,8 +1442,6 @@ def main() -> int:
             base.screenshot(page, out / "original_screenshots" / "registration_not_confirmed.png")
         base.write_json(out / "registration_result.json", reg_result)
 
-        gate_records = gate_catcher.wait(timeout=2.0) if gate_catcher else []
-        base.write_json(out / "captcha_gate_records.json", gate_records)
         base.write_json(
             out / "summary.json",
             {
