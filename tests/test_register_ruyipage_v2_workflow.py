@@ -39,3 +39,14 @@ def test_github_runner_uses_headful_firefox_inside_xvfb():
 
     assert "xvfb-run -a" in command
     assert "--headless" not in command
+
+
+def test_account_export_recovers_backend_success_from_every_attempt():
+    workflow = load_workflow()
+    steps = workflow["jobs"]["register"]["steps"]
+    command = next(step["run"] for step in steps if step.get("name") == "Export successful account")
+
+    assert 'glob("run_*/account_generated.json")' in command
+    assert "captcha_gate_records.json" in command
+    assert "create-success" in command
+    assert "data-step-has-errors" in command

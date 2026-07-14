@@ -256,33 +256,78 @@ jobs:
           from pathlib import Path
 
           root = Path("ruyipage_yescaptcha_register/runs")
-          summaries = list(root.glob("run_*/summary.json"))
-          if not summaries:
+          account_paths = sorted(root.glob("run_*/account_generated.json"))
+          if not account_paths:
               print("No RuyiPage v2 run output found")
               raise SystemExit(0)
 
-          summary_path = max(summaries, key=lambda path: path.stat().st_mtime_ns)
-          run_dir = summary_path.parent
-          registration_path = run_dir / "registration_result.json"
-          account_path = run_dir / "account_generated.json"
-          if not registration_path.exists() or not account_path.exists():
-              print(f"Run output is incomplete: {run_dir}")
-              raise SystemExit(0)
+          def backend_success(run_dir, expected_email):
+              path = run_dir / "captcha_gate_records.json"
+              if not path.exists():
+                  return None
+              records = json.loads(path.read_text(encoding="utf-8"))
+              for record in records:
+                  response = (record or {}).get("response") or {}
+                  if int(response.get("status") or 0) != 200:
+                      continue
+                  outcome = response.get("outcome") or {}
+                  actual_email = str(outcome.get("accountEmail") or "").strip().lower()
+                  if outcome.get("isCreateSuccess") and (not actual_email or actual_email == expected_email.lower()):
+                      return outcome
+                  sample = response.get("sample") or ""
+                  if (
+                      'data-step-id="create-success"' in sample
+                      and 'data-step-has-errors="false"' in sample
+                      and expected_email.lower() in sample.lower()
+                  ):
+                      return {"isCreateSuccess": True, "accountEmail": expected_email}
+              return None
 
-          registration = json.loads(registration_path.read_text(encoding="utf-8"))
-          account = json.loads(account_path.read_text(encoding="utf-8"))
-          if not registration.get("ok"):
-              print(f"Registration did not succeed: {run_dir}")
+          recovered = []
+          seen = set()
+          last_success_dir = None
+          for account_path in account_paths:
+              run_dir = account_path.parent
+              account = json.loads(account_path.read_text(encoding="utf-8"))
+              email = account["email"]
+              registration_path = run_dir / "registration_result.json"
+              registration = (
+                  json.loads(registration_path.read_text(encoding="utf-8"))
+                  if registration_path.exists()
+                  else {}
+              )
+              outcome = backend_success(run_dir, email)
+              if not registration.get("ok") and not outcome:
+                  print(f"No success evidence: {run_dir}")
+                  continue
+              if email.lower() in seen:
+                  continue
+              seen.add(email.lower())
+              player_id = str((outcome or {}).get("playerAccountId") or "")
+              recovered.append(
+                  "\n".join(
+                      [
+                          f"账号：{email}",
+                          f"密码：{account['password']}",
+                          f"BattleTag：{account.get('battle_tag', '')}",
+                          f"PlayerAccountId：{player_id}",
+                      ]
+                  )
+              )
+              last_success_dir = run_dir
+
+          if not recovered:
+              print("No successful account evidence found")
               raise SystemExit(0)
 
           Path("registered_account.txt").write_text(
-              f"账号：{account['email']}\n密码：{account['password']}\n\n",
+              "\n\n".join(recovered) + "\n",
               encoding="utf-8",
           )
-          screenshot = run_dir / "original_screenshots" / "registration_success.png"
+          screenshot = last_success_dir / "original_screenshots" / "registration_success.png"
           if screenshot.exists():
               shutil.copy2(screenshot, "success.png")
-          print(f"Exported successful account from {run_dir}")
+          print(f"Recovered {len(recovered)} successful account(s)")
           PY
 
       - name: Upload screenshots and debug data
