@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event, Lock
 from typing import Any, Dict, Optional
+from urllib.parse import parse_qs
 
 import requests
 
@@ -384,6 +385,219 @@ def completion_rejection_reason(payload: Optional[dict]) -> Optional[str]:
     if error:
         return f"error={error}"
     return None
+
+
+def arkose_token_metadata(token: str) -> dict:
+    """Return Arkose token suffix fields without retaining the opaque first segment."""
+    text = str(token or "")
+    parts = text.split("|")
+    fields: Dict[str, str] = {}
+    flags: list[str] = []
+    for part in parts[1:]:
+        if "=" in part:
+            key, value = part.split("=", 1)
+            fields[key] = value
+        elif part:
+            flags.append(part)
+    return {
+        "tokenLength": len(text),
+        "opaqueLength": len(parts[0]) if parts else 0,
+        "fields": fields,
+        "flags": flags,
+    }
+
+
+CAPTCHA_GATE_PATH = "/creation/flow/creation-full/step/captcha-gate"
+
+
+def is_captcha_gate_url(url: str) -> bool:
+    return CAPTCHA_GATE_PATH in str(url or "")
+
+
+def captcha_gate_request_metadata(body: str) -> dict:
+    text = str(body or "")
+    parsed = parse_qs(text, keep_blank_values=True)
+    field_lengths: Dict[str, int] = {}
+    token_metadata = None
+    for name, values in parsed.items():
+        value = str(values[0] if values else "")
+        field_lengths[name] = len(value)
+        if "arkose" in name.lower():
+            token_metadata = arkose_token_metadata(value)
+    return {
+        "bodyLength": len(text),
+        "fieldNames": list(parsed),
+        "fieldLengths": field_lengths,
+        "arkoseTokenMetadata": token_metadata,
+    }
+
+
+def selected_bidi_headers(headers: Any) -> Dict[str, str]:
+    allowed = {"location", "content-type", "x-request-id", "x-correlation-id"}
+    selected: Dict[str, str] = {}
+    for item in headers or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").lower()
+        if name not in allowed:
+            continue
+        value = item.get("value")
+        if isinstance(value, dict):
+            value = value.get("value")
+        if value is not None:
+            selected[name] = str(value)
+    return selected
+
+
+def build_token_result(page: Any, token: str, actions: list[dict]) -> dict:
+    state = solver_state(page)
+    completed_payload = state.get("completedPayload")
+    metadata = arkose_token_metadata(token)
+    LOG.info("Arkose completedPayload: %s", completed_payload)
+    LOG.info("Arkose token metadata (opaque segment redacted): %s", metadata)
+    return {
+        "ok": True,
+        "token": token,
+        "tokenLength": len(token),
+        "actions": actions,
+        "completedPayload": completed_payload,
+        "tokenMetadata": metadata,
+    }
+
+
+@dataclass
+class RuyiCaptchaGateCatcher:
+    """Capture the Battle.net captcha-gate request/response without storing form values."""
+
+    page: Any
+    records: list[dict] = field(default_factory=list)
+    _driver: Any = None
+    _subscription_id: Optional[str] = None
+    _collector_id: Optional[str] = None
+    _lock: Lock = field(default_factory=Lock)
+    _event: Event = field(default_factory=Event)
+    _by_request_id: Dict[str, dict] = field(default_factory=dict)
+
+    def start(self) -> None:
+        from ruyipage._bidi import network as bidi_network
+        from ruyipage._bidi import session as bidi_session
+
+        self._driver = self.page._driver._browser_driver
+        with contextlib.suppress(Exception):
+            ret = bidi_network.add_data_collector(
+                self._driver,
+                events=["beforeRequestSent", "responseCompleted"],
+                contexts=None,
+                data_types=["request", "response"],
+                max_encoded_data_size=4 * 1024 * 1024,
+            )
+            self._collector_id = ret.get("collector")
+        ret = bidi_session.subscribe(
+            self._driver,
+            ["network.beforeRequestSent", "network.responseCompleted", "network.fetchError"],
+            contexts=None,
+        )
+        self._subscription_id = ret.get("subscription")
+        self._driver.set_callback("network.beforeRequestSent", self._on_request, context=None)
+        self._driver.set_callback("network.responseCompleted", self._on_response, context=None)
+        self._driver.set_callback("network.fetchError", self._on_fetch_error, context=None)
+        LOG.info("Battle.net captcha-gate capture started collector=%s", bool(self._collector_id))
+
+    def stop(self) -> None:
+        from ruyipage._bidi import network as bidi_network
+        from ruyipage._bidi import session as bidi_session
+
+        with contextlib.suppress(Exception):
+            if self._driver:
+                self._driver.remove_callback("network.beforeRequestSent", context=None)
+                self._driver.remove_callback("network.responseCompleted", context=None)
+                self._driver.remove_callback("network.fetchError", context=None)
+        with contextlib.suppress(Exception):
+            if self._driver and self._subscription_id:
+                bidi_session.unsubscribe(self._driver, subscription=self._subscription_id)
+        with contextlib.suppress(Exception):
+            if self._driver and self._collector_id:
+                bidi_network.remove_data_collector(self._driver, self._collector_id)
+
+    def _collector_text(self, request_id: str, data_type: str) -> str:
+        if not self._driver or not self._collector_id or not request_id:
+            return ""
+        from ruyipage._bidi import network as bidi_network
+
+        with contextlib.suppress(Exception):
+            raw = bidi_network.get_data(self._driver, self._collector_id, request_id, data_type=data_type)
+            return base.decode_bidi_body_value(raw)
+        return ""
+
+    def _record_for(self, request_id: str, url: str) -> dict:
+        with self._lock:
+            rec = self._by_request_id.get(request_id)
+            if rec is None:
+                rec = {"requestId": request_id, "url": url, "capturedAt": time.time()}
+                self._by_request_id[request_id] = rec
+                self.records.append(rec)
+            return rec
+
+    def _on_request(self, params: Dict[str, Any]) -> None:
+        req = params.get("request", {}) or {}
+        url = req.get("url", "") or ""
+        if not is_captcha_gate_url(url):
+            return
+        request_id = req.get("request", "") or ""
+        rec = self._record_for(request_id, url)
+        body = base.decode_bidi_body_value(req.get("body"))
+        with self._lock:
+            rec["method"] = req.get("method")
+            rec["request"] = captcha_gate_request_metadata(body)
+        LOG.info("captcha-gate request: method=%s metadata=%s", rec.get("method"), rec.get("request"))
+
+    def _on_response(self, params: Dict[str, Any]) -> None:
+        req = params.get("request", {}) or {}
+        resp = params.get("response", {}) or {}
+        url = resp.get("url") or req.get("url") or ""
+        if not is_captcha_gate_url(url):
+            return
+        request_id = req.get("request", "") or ""
+        rec = self._record_for(request_id, url)
+        request_body = self._collector_text(request_id, "request")
+        response_body = self._collector_text(request_id, "response")
+        sample = re.sub(r"\s+", " ", response_body).strip()[:4000]
+        with self._lock:
+            if request_body:
+                rec["request"] = captcha_gate_request_metadata(request_body)
+            rec["response"] = {
+                "status": resp.get("status") or resp.get("statusCode") or 0,
+                "mime": resp.get("mimeType") or resp.get("mime"),
+                "headers": selected_bidi_headers(resp.get("headers")),
+                "bodyLength": len(response_body),
+                "sample": sample,
+            }
+        self._event.set()
+        LOG.info(
+            "captcha-gate response: status=%s bodyLength=%s sample=%r",
+            rec["response"]["status"],
+            rec["response"]["bodyLength"],
+            sample[:300],
+        )
+
+    def _on_fetch_error(self, params: Dict[str, Any]) -> None:
+        req = params.get("request", {}) or {}
+        url = req.get("url", "") or ""
+        if is_captcha_gate_url(url):
+            request_id = req.get("request", "") or ""
+            rec = self._record_for(request_id, url)
+            with self._lock:
+                rec["fetchError"] = str(params.get("errorText") or params.get("error") or "fetchError")
+            self._event.set()
+            LOG.warning("captcha-gate fetchError: %s", rec["fetchError"])
+
+    def wait(self, timeout: float = 3.0) -> list[dict]:
+        self._event.wait(max(0.0, timeout))
+        return self.snapshot()
+
+    def snapshot(self) -> list[dict]:
+        with self._lock:
+            return [dict(record) for record in self.records]
 
 
 def wait_token_quick(page, timeout: float, prefix: str = "") -> Optional[str]:
@@ -893,7 +1107,7 @@ def auto_solve_solver_tab(solver_tab: Any, catcher: RuyiArkoseImageCatcher, args
 
     token = wait_token_quick(solver_tab, 2.0, "initial ")
     if token:
-        return {"ok": True, "token": token, "tokenLength": len(token), "actions": actions, "completedPayload": solver_state(solver_tab).get("completedPayload")}
+        return build_token_result(solver_tab, token, actions)
 
     if not ensure_verify_or_image(solver_tab, catcher, args.verify_timeout):
         LOG.warning("未确认 Verify 后出现图片，继续等待图片")
@@ -901,7 +1115,7 @@ def auto_solve_solver_tab(solver_tab: Any, catcher: RuyiArkoseImageCatcher, args
     for wave in range(args.max_waves):
         token = wait_token_quick(solver_tab, 1.0, f"wave{wave} pre ")
         if token:
-            return {"ok": True, "token": token, "tokenLength": len(token), "actions": actions, "completedPayload": solver_state(solver_tab).get("completedPayload")}
+            return build_token_result(solver_tab, token, actions)
 
         kind, value = wait_image_or_token(
             catcher,
@@ -911,12 +1125,12 @@ def auto_solve_solver_tab(solver_tab: Any, catcher: RuyiArkoseImageCatcher, args
         )
         if kind == "token":
             token = str(value)
-            return {"ok": True, "token": token, "tokenLength": len(token), "actions": actions, "completedPayload": solver_state(solver_tab).get("completedPayload")}
+            return build_token_result(solver_tab, token, actions)
         rec = value
         if not rec:
             token = wait_token_quick(solver_tab, args.after_submit_token_wait, f"wave{wave} no-image ")
             if token:
-                return {"ok": True, "token": token, "tokenLength": len(token), "actions": actions, "completedPayload": solver_state(solver_tab).get("completedPayload")}
+                return build_token_result(solver_tab, token, actions)
             state = base.captcha_state(solver_tab)
             sample = base.captcha_text(solver_tab).replace("\n", " ")[:260]
             return {"ok": False, "error": f"no new challenge image at wave={wave}, state={state}", "actions": actions, "sample": sample}
@@ -952,11 +1166,11 @@ def auto_solve_solver_tab(solver_tab: Any, catcher: RuyiArkoseImageCatcher, args
 
         token = wait_token_quick(solver_tab, args.after_submit_token_wait, f"wave{wave} post ")
         if token:
-            return {"ok": True, "token": token, "tokenLength": len(token), "actions": actions, "completedPayload": solver_state(solver_tab).get("completedPayload")}
+            return build_token_result(solver_tab, token, actions)
 
     token = wait_token_quick(solver_tab, args.token_timeout, "final ")
     if token:
-        return {"ok": True, "token": token, "tokenLength": len(token), "actions": actions, "completedPayload": solver_state(solver_tab).get("completedPayload")}
+        return build_token_result(solver_tab, token, actions)
     return {"ok": False, "error": f"max_waves exceeded ({args.max_waves}) without token", "actions": actions}
 
 
@@ -1045,7 +1259,9 @@ def main() -> int:
     solver_tab = None
     blob_catcher = None
     img_catcher = None
+    gate_catcher = None
     ca_records: list[dict] = []
+    image_records: list[dict] = []
     try:
         _ = resolve_yescaptcha_key(args)
         acc = generate_identity()
@@ -1120,6 +1336,19 @@ def main() -> int:
         token = str(solve_result["token"])
         LOG.info("Solver tab returned onCompleted token, length=%s", len(token))
 
+        image_records = [{k: v for k, v in r.items() if k != "body_bytes"} for r in img_catcher.captured_images]
+        base.write_json(out / "captured_image_records.json", image_records)
+        with contextlib.suppress(Exception):
+            img_catcher.stop()
+        img_catcher = None
+
+        try:
+            gate_catcher = RuyiCaptchaGateCatcher(page)
+            gate_catcher.start()
+        except Exception as exc:
+            gate_catcher = None
+            LOG.warning("captcha-gate capture start failed: %s: %s", type(exc).__name__, exc)
+
         inject_result = base.inject_token_to_original(page, token)
         base.write_json(out / "token_injection_result.json", inject_result)
         LOG.info("Original tab token injection result: %s", inject_result)
@@ -1136,8 +1365,8 @@ def main() -> int:
             base.screenshot(page, out / "original_screenshots" / "registration_not_confirmed.png")
         base.write_json(out / "registration_result.json", reg_result)
 
-        image_records = [{k: v for k, v in r.items() if k != "body_bytes"} for r in (img_catcher.captured_images if img_catcher else [])]
-        base.write_json(out / "captured_image_records.json", image_records)
+        gate_records = gate_catcher.wait(timeout=2.0) if gate_catcher else []
+        base.write_json(out / "captcha_gate_records.json", gate_records)
         base.write_json(
             out / "summary.json",
             {
@@ -1150,9 +1379,12 @@ def main() -> int:
                 "surl": ctx.get("surl"),
                 "blobLength": len(blob),
                 "tokenLength": len(token),
+                "completedPayload": solve_result.get("completedPayload"),
+                "tokenMetadata": solve_result.get("tokenMetadata"),
                 "yescaptcha": {"question": args.question, "actions": solve_result.get("actions") or []},
                 "injectResult": inject_result,
                 "registration": reg_result,
+                "captchaGateRecords": gate_records,
                 "caRecords": ca_records,
                 "imageRecords": image_records,
             },
@@ -1171,6 +1403,10 @@ def main() -> int:
                 out / "yescaptcha_solver_result.json",
                 {"ok": False, "error": str(exc), "completedPayload": exc.payload},
             )
+        if gate_catcher is not None:
+            with contextlib.suppress(Exception):
+                failure_summary["captchaGateRecords"] = gate_catcher.snapshot()
+                base.write_json(out / "captcha_gate_records.json", failure_summary["captchaGateRecords"])
         base.write_json(out / "summary.json", failure_summary)
         with contextlib.suppress(Exception):
             if page:
@@ -1183,6 +1419,9 @@ def main() -> int:
         with contextlib.suppress(Exception):
             if img_catcher:
                 img_catcher.stop()
+        with contextlib.suppress(Exception):
+            if gate_catcher:
+                gate_catcher.stop()
         with contextlib.suppress(Exception):
             if blob_catcher:
                 blob_catcher.stop()

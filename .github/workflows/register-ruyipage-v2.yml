@@ -211,6 +211,14 @@ jobs:
           YESCAPTCHA_API_KEY: ${{ inputs.yescaptcha_key }}
         run: echo "::add-mask::$YESCAPTCHA_API_KEY"
 
+      - name: Ensure Xvfb is available
+        run: |
+          if ! command -v xvfb-run >/dev/null 2>&1 || ! command -v xauth >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y xvfb xauth
+          fi
+          xvfb-run --help >/dev/null
+
       - name: Run RuyiPage v2 registration
         env:
           YESCAPTCHA_API_KEY: ${{ inputs.yescaptcha_key }}
@@ -220,8 +228,7 @@ jobs:
           last_rc=1
           for attempt in 1 2 3; do
             echo "::group::Registration attempt ${attempt}/3"
-            if python register_ruyipage_v2.py \
-              --headless \
+            if xvfb-run -a --server-args="-screen 0 1920x1080x24" python register_ruyipage_v2.py \
               --network-mode 1 \
               --click-style human \
               --human-move-min-ms 800 \

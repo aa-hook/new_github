@@ -30,3 +30,12 @@ def test_registration_step_retries_three_times_with_fixed_browser_arguments():
     assert "--click-style human" in command
     assert "--human-move-min-ms 800" in command
     assert "--human-move-max-ms 1400" in command
+
+
+def test_github_runner_uses_headful_firefox_inside_xvfb():
+    workflow = load_workflow()
+    steps = workflow["jobs"]["register"]["steps"]
+    command = next(step["run"] for step in steps if step.get("name") == "Run RuyiPage v2 registration")
+
+    assert "xvfb-run -a" in command
+    assert "--headless" not in command
