@@ -1,0 +1,426 @@
+name: Battle.net auto register (RuyiPage v3 + local V11)
+
+on:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: "number of registration jobs (1-256)"
+        required: true
+        default: "1"
+        type: string
+      max_parallel:
+        description: "maximum concurrent matrix jobs (1-256)"
+        required: true
+        default: "10"
+        type: string
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      indices: ${{ steps.matrix.outputs.indices }}
+      max_parallel: ${{ steps.matrix.outputs.max_parallel }}
+    steps:
+      - name: Validate inputs and generate matrix
+        id: matrix
+        env:
+          REQUESTED_COUNT: ${{ inputs.count }}
+          REQUESTED_MAX_PARALLEL: ${{ inputs.max_parallel }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          def bounded_int(name: str, raw: str, upper: int) -> int:
+              try:
+                  value = int(raw)
+              except (TypeError, ValueError):
+                  raise SystemExit(f"{name} must be an integer, got {raw!r}")
+              if not 1 <= value <= upper:
+                  raise SystemExit(f"{name} must be in 1..{upper}, got {value}")
+              return value
+
+          count = bounded_int("count", os.environ["REQUESTED_COUNT"], 256)
+          max_parallel = bounded_int(
+              "max_parallel", os.environ["REQUESTED_MAX_PARALLEL"], 256
+          )
+          max_parallel = min(max_parallel, count)
+          output = Path(os.environ["GITHUB_OUTPUT"])
+          with output.open("a", encoding="utf-8") as fp:
+              fp.write(f"indices={json.dumps(list(range(1, count + 1)))}\n")
+              fp.write(f"max_parallel={max_parallel}\n")
+          print(f"matrix size: {count}, max_parallel: {max_parallel}")
+          PY
+
+  deps-cache:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Cache wheelhouse
+        id: wheelhouse
+        uses: actions/cache@v5
+        with:
+          path: .wheelhouse
+          key: ruyipage-v3-wheelhouse-${{ runner.os }}-py312-${{ hashFiles('requirements-ruyipage-v3.txt', 'rank_v11/requirements.txt') }}
+          restore-keys: |
+            ruyipage-v3-wheelhouse-${{ runner.os }}-py312-
+
+      - name: Build wheelhouse
+        if: steps.wheelhouse.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          mkdir -p .wheelhouse
+          pip download torch torchvision \
+            --index-url https://download.pytorch.org/whl/cpu \
+            -d .wheelhouse
+          pip download -r requirements-ruyipage-v3.txt \
+            --find-links .wheelhouse \
+            -d .wheelhouse
+          echo "wheel count: $(find .wheelhouse -type f -name '*.whl' | wc -l)"
+
+      - name: Cache virtualenv
+        id: venv
+        uses: actions/cache@v5
+        with:
+          path: .venv
+          key: ruyipage-v3-venv-${{ runner.os }}-py312-${{ hashFiles('requirements-ruyipage-v3.txt', 'rank_v11/requirements.txt') }}
+          restore-keys: |
+            ruyipage-v3-venv-${{ runner.os }}-py312-
+
+      - name: Build virtualenv
+        if: steps.venv.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          if [ -n "$(find .wheelhouse -type f -name '*.whl' -print -quit 2>/dev/null)" ]; then
+            .venv/bin/pip install --no-index --find-links .wheelhouse \
+              torch torchvision -r requirements-ruyipage-v3.txt
+          else
+            .venv/bin/pip install torch torchvision \
+              --index-url https://download.pytorch.org/whl/cpu
+            .venv/bin/pip install -r requirements-ruyipage-v3.txt
+          fi
+          .venv/bin/python - <<'PY'
+          import importlib.util
+
+          modules = [
+              "cloakbrowser", "ruyipage", "websocket", "requests", "PIL",
+              "numpy", "cv2", "torch", "torchvision",
+          ]
+          missing = [name for name in modules if importlib.util.find_spec(name) is None]
+          if missing:
+              raise SystemExit(f"missing modules: {missing}")
+          print("RuyiPage v3 + local V11 dependency check OK")
+          PY
+
+      - name: Cache RuyiPage Firefox runtime
+        id: ruyi-runtime
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/ruyipage
+          key: ruyipage-firefox-${{ runner.os }}-v1
+          restore-keys: |
+            ruyipage-firefox-${{ runner.os }}-
+
+      - name: Warm RuyiPage Firefox runtime
+        if: steps.ruyi-runtime.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          .venv/bin/python -m ruyipage install
+          .venv/bin/python -m ruyipage doctor
+
+  register:
+    needs: [prepare, deps-cache]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(needs.prepare.outputs.max_parallel) }}
+      matrix:
+        index: ${{ fromJSON(needs.prepare.outputs.indices) }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Restore virtualenv
+        id: venv
+        uses: actions/cache@v5
+        with:
+          path: .venv
+          key: ruyipage-v3-venv-${{ runner.os }}-py312-${{ hashFiles('requirements-ruyipage-v3.txt', 'rank_v11/requirements.txt') }}
+          restore-keys: |
+            ruyipage-v3-venv-${{ runner.os }}-py312-
+
+      - name: Restore wheelhouse fallback
+        if: steps.venv.outputs.cache-hit != 'true'
+        uses: actions/cache@v5
+        with:
+          path: .wheelhouse
+          key: ruyipage-v3-wheelhouse-${{ runner.os }}-py312-${{ hashFiles('requirements-ruyipage-v3.txt', 'rank_v11/requirements.txt') }}
+          restore-keys: |
+            ruyipage-v3-wheelhouse-${{ runner.os }}-py312-
+
+      - name: Restore RuyiPage Firefox runtime
+        id: ruyi-runtime
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/ruyipage
+          key: ruyipage-firefox-${{ runner.os }}-v1
+          restore-keys: |
+            ruyipage-firefox-${{ runner.os }}-
+
+      - name: Activate or install dependencies
+        env:
+          VENV_CACHE_HIT: ${{ steps.venv.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          if [ "$VENV_CACHE_HIT" != "true" ] || [ ! -x .venv/bin/python ]; then
+            python -m venv .venv
+            .venv/bin/python -m pip install --upgrade pip
+            if [ -n "$(find .wheelhouse -type f -name '*.whl' -print -quit 2>/dev/null)" ]; then
+              .venv/bin/pip install --no-index --find-links .wheelhouse \
+                torch torchvision -r requirements-ruyipage-v3.txt
+            else
+              .venv/bin/pip install torch torchvision \
+                --index-url https://download.pytorch.org/whl/cpu
+              .venv/bin/pip install -r requirements-ruyipage-v3.txt
+            fi
+          else
+            echo "virtualenv cache hit"
+          fi
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          .venv/bin/python -V
+          if ! .venv/bin/python -m ruyipage doctor; then
+            .venv/bin/python -m ruyipage install
+            .venv/bin/python -m ruyipage doctor
+          fi
+
+      - name: Ensure Xvfb is available
+        run: |
+          if ! command -v xvfb-run >/dev/null 2>&1 || ! command -v xauth >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y xvfb xauth
+          fi
+          xvfb-run --help >/dev/null
+
+      - name: Start persistent local V11 service
+        env:
+          RANK_V11_URL: http://127.0.0.1:8765
+          RANK_V11_CACHE_DIR: ${{ runner.temp }}/rank_v11_cache_${{ matrix.index }}
+        run: |
+          set -euo pipefail
+          nohup .venv/bin/python rank_v11/server.py \
+            --host 127.0.0.1 \
+            --port 8765 \
+            --device cpu \
+            --cpu-threads 2 \
+            --mode accurate \
+            --cache-dir "$RANK_V11_CACHE_DIR" \
+            > rank_v11_server.log 2>&1 &
+          echo $! > rank_v11_server.pid
+          if ! .venv/bin/python rank_v11/wait_ready.py \
+              --url "$RANK_V11_URL" \
+              --timeout 180; then
+            echo "::error::Local V11 service failed to become ready"
+            cat rank_v11_server.log || true
+            exit 1
+          fi
+
+      - name: Run RuyiPage v3 registration
+        env:
+          RANK_V11_URL: http://127.0.0.1:8765
+          PYTHONUNBUFFERED: "1"
+          MATRIX_INDEX: "${{ matrix.index }}"
+        run: |
+          last_rc=1
+          for attempt in 1 2 3; do
+            echo "::group::Registration attempt ${attempt}/3"
+            if xvfb-run -a --server-args="-screen 0 1920x1080x24" python register_ruyipage_v3.py \
+              --network-mode 1 \
+              --click-style human \
+              --human-move-min-ms 800 \
+              --human-move-max-ms 1400 \
+              --rank-v11-url "$RANK_V11_URL"; then
+              echo "::endgroup::"
+              echo "Registration succeeded on attempt ${attempt}/3"
+              exit 0
+            else
+              last_rc=$?
+              echo "Registration attempt ${attempt}/3 exited with ${last_rc}"
+              echo "::endgroup::"
+            fi
+            if [ "$last_rc" -eq 42 ]; then
+              echo "Unsupported Arkose classification; stop this matrix job without retry"
+              exit 42
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 5))
+            fi
+          done
+          exit "$last_rc"
+
+      - name: Stop local V11 service
+        if: always()
+        run: |
+          if [ -f rank_v11_server.pid ]; then
+            kill "$(cat rank_v11_server.pid)" 2>/dev/null || true
+          fi
+
+      - name: Export successful account
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          import shutil
+          from pathlib import Path
+
+          root = Path("ruyipage_local_v11_register/runs")
+          account_paths = sorted(root.glob("run_*/account_generated.json"))
+          if not account_paths:
+              print("No RuyiPage v3 run output found")
+              raise SystemExit(0)
+
+          def backend_success(run_dir, expected_email):
+              path = run_dir / "captcha_gate_records.json"
+              if not path.exists():
+                  return None
+              records = json.loads(path.read_text(encoding="utf-8"))
+              for record in records:
+                  response = (record or {}).get("response") or {}
+                  if int(response.get("status") or 0) != 200:
+                      continue
+                  outcome = response.get("outcome") or {}
+                  actual_email = str(outcome.get("accountEmail") or "").strip().lower()
+                  if outcome.get("isCreateSuccess") and (not actual_email or actual_email == expected_email.lower()):
+                      return outcome
+                  sample = response.get("sample") or ""
+                  if (
+                      'data-step-id="create-success"' in sample
+                      and 'data-step-has-errors="false"' in sample
+                      and expected_email.lower() in sample.lower()
+                  ):
+                      return {"isCreateSuccess": True, "accountEmail": expected_email}
+              return None
+
+          recovered = []
+          seen = set()
+          last_success_dir = None
+          for account_path in account_paths:
+              run_dir = account_path.parent
+              account = json.loads(account_path.read_text(encoding="utf-8"))
+              email = account["email"]
+              registration_path = run_dir / "registration_result.json"
+              registration = (
+                  json.loads(registration_path.read_text(encoding="utf-8"))
+                  if registration_path.exists()
+                  else {}
+              )
+              outcome = backend_success(run_dir, email)
+              if not registration.get("ok") and not outcome:
+                  print(f"No success evidence: {run_dir}")
+                  continue
+              if email.lower() in seen:
+                  continue
+              seen.add(email.lower())
+              player_id = str((outcome or {}).get("playerAccountId") or "")
+              recovered.append(
+                  "\n".join(
+                      [
+                          f"账号：{email}",
+                          f"密码：{account['password']}",
+                          f"BattleTag：{account.get('battle_tag', '')}",
+                          f"PlayerAccountId：{player_id}",
+                      ]
+                  )
+              )
+              last_success_dir = run_dir
+
+          if not recovered:
+              print("No successful account evidence found")
+              raise SystemExit(0)
+
+          Path("registered_account.txt").write_text(
+              "\n\n".join(recovered) + "\n",
+              encoding="utf-8",
+          )
+          screenshot = last_success_dir / "original_screenshots" / "registration_success.png"
+          if screenshot.exists():
+              shutil.copy2(screenshot, "success.png")
+          print(f"Recovered {len(recovered)} successful account(s)")
+          PY
+
+      - name: Upload screenshots and debug data
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ruyi-v3-local-reg-data-${{ matrix.index }}
+          path: |
+            success.png
+            rank_v11_server.log
+            ruyipage_local_v11_register/runs/**
+          if-no-files-found: ignore
+
+      - name: Upload account data
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ruyi-v3-local-reg-accounts-${{ matrix.index }}
+          path: registered_account.txt
+          if-no-files-found: ignore
+
+  collect:
+    needs: register
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all account artifacts
+        continue-on-error: true
+        uses: actions/download-artifact@v7
+        with:
+          pattern: ruyi-v3-local-reg-accounts-*
+          path: all_accounts
+          merge-multiple: false
+
+      - name: Merge account files
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          files = sorted(Path("all_accounts").glob("**/registered_account.txt"))
+          chunks = [path.read_text(encoding="utf-8").rstrip() for path in files]
+          output = "\n\n".join(chunk for chunk in chunks if chunk).strip()
+          if output:
+              output += "\n"
+          else:
+              output = "(no successful accounts)\n"
+          Path("all_accounts.txt").write_text(output, encoding="utf-8")
+          print(f"Merged {len(files)} account file(s)")
+          PY
+
+      - name: Upload merged account data
+        uses: actions/upload-artifact@v6
+        with:
+          name: all-ruyipage-v3-local-registered-accounts
+          path: all_accounts.txt
+          if-no-files-found: error

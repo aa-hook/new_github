@@ -1,0 +1,279 @@
+{
+  "schema_version": "route_v11_model_manifest_v1",
+  "fast_checkpoint": "route_v11_fast_v10.pt",
+  "legacy_checkpoint": "route_v11_legacy_v9.pt",
+  "expert_checkpoint": "route_v11_expert336.pt",
+  "margin_advantage": 0.01,
+  "require_legacy_consensus": true,
+  "selection_rule": "default to V11 expert; switch to V10 only when V10 and V9 agree, V10 disagrees with V11, and V10 margin exceeds V11 margin by the threshold",
+  "modes": {
+    "fast": "280px V10 primary ranker",
+    "accurate": "336px V11 expert with V10/V9 consensus margin gate"
+  },
+  "sha256": {
+    "fast": "5437e42a4256858d4ad6f5e174b2c7d401a5e1e17b825eba2f50f4cedadf144a",
+    "legacy": "6032096254f8288e12a7cae0918b17e4894cb61911128542ee02a66a478c9651",
+    "expert": "79b0359915453fca071a4d1bb9155f54e6c98eeddbad523c52d166cecadd4eed"
+  },
+  "expert_training": {
+    "checkpoint": "route_ranker\\checkpoints\\route_v11_xin_expert336_hard500_b4w2_seed20260722\\best.pt",
+    "best_epoch": 10,
+    "best_val": {
+      "top1": 1.0,
+      "top2": 1.0,
+      "loss": 0.13143062114715576
+    },
+    "locked_test": {
+      "loss": 0.028307774861653645,
+      "top1": 0.9966666666666667,
+      "top2": 1.0,
+      "correct_top1": 299,
+      "correct_top2": 300,
+      "rows": 300
+    },
+    "rows": {
+      "train": 3899,
+      "val": 200,
+      "locked": 300
+    },
+    "baseline_locked_hybrid_v1": {
+      "correct_top1": 28,
+      "rows": 50,
+      "top1": 0.56,
+      "top2": 0.7
+    },
+    "config": {
+      "train_label": [
+        "route_ranker\\data\\route_v10_jpg7_v1_train.jsonl",
+        "route_ranker\\data\\route_v11_xin_v1_train.jsonl"
+      ],
+      "val_label": "route_ranker\\data\\route_v11_xin_v1_val.jsonl",
+      "locked_label": "route_ranker\\data\\route_v10_jpg7_v1_locked.jsonl",
+      "focus_label": "route_ranker\\data\\route_v11_xin_v10_hard500.jsonl",
+      "focus_fraction": 0.55,
+      "init_v7": "route_ranker\\models\\route_v10_jpg7_v1\\route_v10_primary.pt",
+      "init_v6": "route_ranker/checkpoints/route_v6_foot_v1_seed20260715/best.pt",
+      "out_dir": "route_ranker\\checkpoints\\route_v11_xin_expert336_hard500_b4w2_seed20260722",
+      "cache_dir": "route_ranker\\cache\\route_v11_336_280",
+      "precache": true,
+      "device": "cuda",
+      "image_size": 336,
+      "foot_crop_size": 280,
+      "embedding_dim": 128,
+      "hidden": 192,
+      "transformer_layers": 2,
+      "attention_heads": 4,
+      "dropout": 0.14,
+      "epochs": 14,
+      "patience": 5,
+      "batch_size": 4,
+      "workers": 2,
+      "allow_windows_workers": true,
+      "prefetch_factor": 1,
+      "learning_rate": 0.0001,
+      "backbone_learning_rate": 1e-05,
+      "weight_decay": 0.002,
+      "label_smoothing": 0.02,
+      "freeze_backbone_epochs": 0,
+      "seed": 20260722,
+      "train_labels": [
+        "route_ranker\\data\\route_v10_jpg7_v1_train.jsonl",
+        "route_ranker\\data\\route_v11_xin_v1_train.jsonl"
+      ],
+      "effective_workers": 2,
+      "pin_memory": false
+    },
+    "warm_start": {
+      "source": "route_v7",
+      "checkpoint": "route_ranker\\models\\route_v10_jpg7_v1\\route_v10_primary.pt",
+      "epoch": 11,
+      "model_tensors": 286
+    }
+  },
+  "train_selection": {
+    "schema_version": "route_v11_gate_evaluation_v1",
+    "rows": 2106,
+    "margin_advantage": 0.01,
+    "require_legacy_consensus": true,
+    "selection_rule": "default to V11 expert; switch to V10 only when V10 and V9 agree, V10 disagrees with V11, and V10 margin exceeds V11 margin by the threshold",
+    "fast": {
+      "correct": 2094,
+      "rows": 2106,
+      "top1": 0.9943019943019943,
+      "correct_top2": 2102,
+      "top2": 0.9981006647673314
+    },
+    "legacy_v9": {
+      "correct": 2069,
+      "rows": 2106,
+      "top1": 0.9824311490978158,
+      "correct_top2": 2103,
+      "top2": 0.9985754985754985
+    },
+    "expert": {
+      "correct": 2103,
+      "rows": 2106,
+      "top1": 0.9985754985754985,
+      "correct_top2": 2106,
+      "top2": 1.0
+    },
+    "accurate": {
+      "correct": 2106,
+      "rows": 2106,
+      "top1": 1.0,
+      "correct_top2": 2106,
+      "top2": 1.0
+    },
+    "oracle": {
+      "correct": 2106,
+      "rows": 2106,
+      "top1": 1.0
+    },
+    "disagreements": 15,
+    "legacy_consensus_disagreements": 6,
+    "switches": 3,
+    "features": {
+      "v10": "route_ranker\\cache\\route_v11_v10_features\\train.pt",
+      "v9": "route_ranker\\cache\\route_v11_v9_features\\train.pt",
+      "expert": "route_ranker\\cache\\route_v11_expert336_features\\train.pt"
+    },
+    "created_at": "2026-07-17T23:49:23.006245+08:00"
+  },
+  "validation_selection": {
+    "schema_version": "route_v11_gate_evaluation_v1",
+    "rows": 200,
+    "margin_advantage": 0.01,
+    "require_legacy_consensus": true,
+    "selection_rule": "default to V11 expert; switch to V10 only when V10 and V9 agree, V10 disagrees with V11, and V10 margin exceeds V11 margin by the threshold",
+    "fast": {
+      "correct": 200,
+      "rows": 200,
+      "top1": 1.0,
+      "correct_top2": 200,
+      "top2": 1.0
+    },
+    "legacy_v9": {
+      "correct": 196,
+      "rows": 200,
+      "top1": 0.98,
+      "correct_top2": 199,
+      "top2": 0.995
+    },
+    "expert": {
+      "correct": 200,
+      "rows": 200,
+      "top1": 1.0,
+      "correct_top2": 200,
+      "top2": 1.0
+    },
+    "accurate": {
+      "correct": 200,
+      "rows": 200,
+      "top1": 1.0,
+      "correct_top2": 200,
+      "top2": 1.0
+    },
+    "oracle": {
+      "correct": 200,
+      "rows": 200,
+      "top1": 1.0
+    },
+    "disagreements": 0,
+    "legacy_consensus_disagreements": 0,
+    "switches": 0,
+    "features": {
+      "v10": "route_ranker\\cache\\route_v11_v10_features\\val.pt",
+      "v9": "route_ranker\\cache\\route_v11_v9_features\\val.pt",
+      "expert": "route_ranker\\cache\\route_v11_expert336_features\\val.pt"
+    },
+    "created_at": "2026-07-17T23:49:22.880032+08:00"
+  },
+  "locked_evaluation": {
+    "schema_version": "route_v11_gate_evaluation_v1",
+    "rows": 500,
+    "margin_advantage": 0.01,
+    "require_legacy_consensus": true,
+    "selection_rule": "default to V11 expert; switch to V10 only when V10 and V9 agree, V10 disagrees with V11, and V10 margin exceeds V11 margin by the threshold",
+    "fast": {
+      "correct": 498,
+      "rows": 500,
+      "top1": 0.996,
+      "correct_top2": 500,
+      "top2": 1.0
+    },
+    "legacy_v9": {
+      "correct": 498,
+      "rows": 500,
+      "top1": 0.996,
+      "correct_top2": 500,
+      "top2": 1.0
+    },
+    "expert": {
+      "correct": 497,
+      "rows": 500,
+      "top1": 0.994,
+      "correct_top2": 500,
+      "top2": 1.0
+    },
+    "accurate": {
+      "correct": 499,
+      "rows": 500,
+      "top1": 0.998,
+      "correct_top2": 500,
+      "top2": 1.0
+    },
+    "oracle": {
+      "correct": 500,
+      "rows": 500,
+      "top1": 1.0
+    },
+    "disagreements": 5,
+    "legacy_consensus_disagreements": 2,
+    "switches": 2,
+    "features": {
+      "v10": "route_ranker\\cache\\route_v11_locked500_features\\v10.pt",
+      "v9": "route_ranker\\cache\\route_v11_locked500_features\\v9.pt",
+      "expert": "route_ranker\\cache\\route_v11_locked500_features\\expert.pt"
+    },
+    "created_at": "2026-07-17T23:53:03.136671+08:00"
+  },
+  "data_audit": {
+    "schema_version": "route_v10_data_audit_v1",
+    "image_dir": "E:\\Downloads\\xin",
+    "source_images": 2808,
+    "eligible_route_images": 2806,
+    "excluded_layout_count": 2,
+    "excluded_layout": [
+      {
+        "image": "E:\\Downloads\\xin\\solver_captcha_001_9eb700713137.jpg",
+        "width": 1200,
+        "height": 400
+      },
+      {
+        "image": "E:\\Downloads\\xin\\solver_captcha_001_e25b8a2f7034.jpg",
+        "width": 1200,
+        "height": 400
+      }
+    ],
+    "labeled_images": 2808,
+    "eligible_labeled_images": 2806,
+    "unique_content_hashes": 2806,
+    "prior_training_overlap": 0,
+    "forced_train_images": 250,
+    "counts": {
+      "train": 2106,
+      "val": 200,
+      "locked": 500
+    },
+    "outputs": {
+      "train": "route_ranker\\data\\route_v11_xin_v1_train.jsonl",
+      "val": "route_ranker\\data\\route_v11_xin_v1_val.jsonl",
+      "locked": "route_ranker\\data\\route_v11_xin_v1_locked.jsonl",
+      "excluded_duplicates": "route_ranker\\data\\route_v11_xin_v1_excluded_duplicates.jsonl",
+      "manifest": "route_ranker\\data\\route_v11_xin_v1_manifest.json"
+    },
+    "locked_manifest": "route_ranker\\data\\route_v11_xin_locked500_seed20260721.json",
+    "created_at": "2026-07-17T22:44:33.277587+08:00"
+  },
+  "created_at": "2026-07-17T23:53:57.217662+08:00"
+}

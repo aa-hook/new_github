@@ -1,0 +1,82 @@
+name: rank-v11-256-jobs
+
+on:
+  workflow_dispatch:
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      value: ${{ steps.build.outputs.value }}
+    steps:
+      - id: build
+        shell: bash
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          print("value=" + json.dumps({"job_index": list(range(256))}))
+          PY
+
+  solve:
+    needs: matrix
+    # max-parallel is an upper bound; the account's GitHub concurrency limit still applies.
+    strategy:
+      fail-fast: false
+      max-parallel: 256
+      matrix: ${{ fromJSON(needs.matrix.outputs.value) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: rank_v11/requirements.txt
+
+      - name: Install rank_v11
+        run: pip install -r rank_v11/requirements.txt
+
+      - name: Create or download this job's challenge image
+        shell: bash
+        run: |
+          # Replace this block with the registration/capture step for this matrix job.
+          # The final image must be a 2000x400 JPG at this path.
+          test -f "$RUNNER_TEMP/challenge_${{ matrix.job_index }}.jpg"
+
+      - name: Start persistent rank_v11 service
+        shell: bash
+        env:
+          RANK_V11_DEVICE: auto
+          RANK_V11_PORT: "8765"
+          RANK_V11_CACHE_DIR: ${{ runner.temp }}/rank_v11_cache_${{ matrix.job_index }}
+        run: |
+          nohup python rank_v11/server.py \
+            --host 127.0.0.1 \
+            --port "$RANK_V11_PORT" \
+            --device "$RANK_V11_DEVICE" \
+            --mode accurate \
+            --cache-dir "$RANK_V11_CACHE_DIR" \
+            >"$RUNNER_TEMP/rank_v11_${{ matrix.job_index }}.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/rank_v11_${{ matrix.job_index }}.pid"
+          python rank_v11/wait_ready.py --url http://127.0.0.1:8765 --timeout 180
+
+      - name: Solve image
+        id: solve
+        shell: bash
+        run: |
+          ANSWER_INDEX=$(python rank_v11/solve.py \
+            "$RUNNER_TEMP/challenge_${{ matrix.job_index }}.jpg" \
+            --url http://127.0.0.1:8765 \
+            --mode accurate)
+          echo "answer_index=$ANSWER_INDEX" >> "$GITHUB_OUTPUT"
+          echo "answer_index=$ANSWER_INDEX"
+
+      - name: Stop service
+        if: always()
+        shell: bash
+        run: |
+          PID_FILE="$RUNNER_TEMP/rank_v11_${{ matrix.job_index }}.pid"
+          if [[ -f "$PID_FILE" ]]; then
+            kill "$(cat "$PID_FILE")" 2>/dev/null || true
+          fi
