@@ -203,6 +203,7 @@ jobs:
             xvfb-run -a --server-args="-screen 0 1920x1080x24" \
               .venv/bin/python register_ruyipage_v4.py \
                 --proxy "$REGISTRATION_PROXY" \
+                --country-probe \
                 --click-style balanced \
                 --rank-v11-url "$RANK_V11_URL"
             last_rc=$?

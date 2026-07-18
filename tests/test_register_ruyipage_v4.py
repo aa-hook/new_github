@@ -106,6 +106,14 @@ def test_invalid_proxy_is_rejected(value):
         app.parse_proxy(value)
 
 
+def test_country_probe_is_default_and_can_only_be_disabled_explicitly():
+    parser = app.build_parser()
+
+    assert parser.parse_args([]).country_probe is True
+    assert parser.parse_args(["--country-probe"]).country_probe is True
+    assert parser.parse_args(["--no-country-probe"]).country_probe is False
+
+
 def test_low_traffic_filter_keeps_arkose_images_and_blocks_only_nonessential_assets():
     assert not app.should_block_resource(
         "https://blizzard-api.arkoselabs.com/rtig/image?challenge=0"
@@ -219,7 +227,7 @@ def test_main_returns_v11_token_to_original_http_session(tmp_path, monkeypatch):
     assert calls["run_to_captcha"] == {
         "country": "GBR",
         "opt_in": False,
-        "country_probe": False,
+        "country_probe": True,
     }
     assert calls["client"]["proxy"] == "http://u:p@10.0.0.1:8080"
     assert calls["solver_proxy"] == "http://u:p@10.0.0.1:8080"
@@ -230,6 +238,7 @@ def test_main_returns_v11_token_to_original_http_session(tmp_path, monkeypatch):
     summary = json.loads((run_dir / "summary.json").read_text("utf-8"))
     assert result["ok"] is True
     assert summary["registrationCountry"] == "GBR"
+    assert summary["countryProbe"] is True
     assert summary["proxy"]["hasAuth"] is True
     assert "secret" not in json.dumps(summary)
 

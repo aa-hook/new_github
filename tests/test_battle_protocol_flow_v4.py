@@ -103,7 +103,7 @@ def test_server_rendered_arkose_context_is_detected():
     assert context["surl"] == "fixture-api.arkoselabs.com"
 
 
-def test_default_no_probe_flow_reaches_captcha_and_submits_token(tmp_path: Path):
+def test_default_country_probe_flow_reaches_captcha_and_submits_token(tmp_path: Path):
     entry = "https://HOST/creation/flow/creation-full"
     login = """
     <form method="post" action="https://LOGIN_HOST/login/en/?flowTrackingId=test">
@@ -122,6 +122,14 @@ def test_default_no_probe_flow_reaches_captcha_and_submits_token(tmp_path: Path)
             flow_form(
                 "get-started",
                 "csrf-1",
+                '<input type="hidden" name="dob-format" value="DMY">',
+            ),
+            entry,
+        ),
+        FakeResponse(
+            flow_form(
+                "get-started",
+                "csrf-probed",
                 '<input type="hidden" name="dob-format" value="DMY">',
             ),
             entry,
@@ -168,15 +176,20 @@ def test_default_no_probe_flow_reaches_captcha_and_submits_token(tmp_path: Path)
         session=session,
     )
 
-    form = client.run_to_captcha(country="GBR", country_probe=False)
+    form = client.run_to_captcha(country="GBR")
     outcome = client.submit_captcha("TOKEN_FROM_RUYI")
 
     assert form.step == "captcha-gate"
     assert state.data["arkose"]["blob"] == blob
+    assert state.data["countryProbed"] is True
     assert outcome["status"] == "success"
     assert outcome["playerAccountId"] == "987"
     assert state.data["status"] == "complete"
     assert b"TOKEN_FROM_RUYI" in session.calls[-1]["data"]
+    assert session.calls[2]["method"] == "PUT"
+    assert b"csrf-1" in session.calls[2]["data"]
+    assert session.calls[3]["method"] == "POST"
+    assert b"csrf-probed" in session.calls[3]["data"]
     assert all(
         call["proxies"]["https"] == "http://u:p@proxy.test:8080"
         for call in session.calls

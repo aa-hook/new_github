@@ -37,7 +37,7 @@ socks5://username:password@host:port
 
 - No browser is used for form filling.
 - No IP or geography probe runs.
-- The country probe is skipped unless `--country-probe` is explicitly supplied.
+- One lightweight GBR country probe runs before date-of-birth submission; this is required by the server-rendered flow.
 - RuyiPage starts after the HTTP flow reaches `captcha-gate` and closes immediately after obtaining the token.
 - Browser fonts, media, and common analytics hosts are blocked; Arkose assets and challenge images remain enabled.
 - Per-wave screenshots are disabled unless `--debug-screenshots` is supplied.

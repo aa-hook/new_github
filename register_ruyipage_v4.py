@@ -487,7 +487,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--protocol-impersonate", default="chrome")
     parser.add_argument("--protocol-user-agent", default="")
     parser.add_argument("--protocol-timeout", type=float, default=45.0)
-    parser.add_argument("--country-probe", action="store_true")
+    country_probe = parser.add_mutually_exclusive_group()
+    country_probe.add_argument(
+        "--country-probe",
+        dest="country_probe",
+        action="store_true",
+        default=True,
+        help="probe the GBR country form before submitting date of birth (default)",
+    )
+    country_probe.add_argument(
+        "--no-country-probe",
+        dest="country_probe",
+        action="store_false",
+        help="skip the country probe for protocol diagnostics",
+    )
     parser.add_argument("--email")
     parser.add_argument("--password")
     parser.add_argument("--battle-tag")
@@ -567,6 +580,7 @@ def main() -> int:
                 profile={
                     "mode": "persistent-http-ruyipage-local-v11",
                     "registrationCountry": REGISTRATION_COUNTRY,
+                    "countryProbe": bool(args.country_probe),
                     "proxy": proxy.summary(),
                     "protocolImpersonate": args.protocol_impersonate,
                 },
@@ -667,6 +681,7 @@ def main() -> int:
                 "outputDir": str(out),
                 "mode": "persistent-http-ruyipage-local-v11",
                 "registrationCountry": REGISTRATION_COUNTRY,
+                "countryProbe": bool(args.country_probe),
                 "proxy": proxy.summary(),
                 "arkose": public_arkose_context(arkose),
                 "rankV11": {
@@ -716,6 +731,7 @@ def main() -> int:
             "error": error_text,
             "outputDir": str(out),
             "registrationCountry": REGISTRATION_COUNTRY,
+            "countryProbe": bool(args.country_probe),
             "proxy": proxy.summary(),
             "elapsedSeconds": time.perf_counter() - started,
         }

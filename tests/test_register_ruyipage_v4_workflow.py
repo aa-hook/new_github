@@ -63,6 +63,7 @@ def test_registration_uses_http_v4_ruyi_local_v11_and_optional_proxy():
 
     assert "register_ruyipage_v4.py" in command
     assert '--proxy "$REGISTRATION_PROXY"' in command
+    assert "--country-probe" in command
     assert 'echo "::add-mask::$REGISTRATION_PROXY"' in command
     assert "--click-style balanced" in command
     assert "for attempt in 1 2 3" in command
