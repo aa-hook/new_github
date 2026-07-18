@@ -150,7 +150,7 @@ def is_public_static_candidate(url: str, method: str = "GET") -> bool:
         return False
 
     path = parsed.path.lower()
-    if path.startswith("/cdn/fc/"):
+    if path.startswith(("/cdn/fc/", "/fc/assets/")):
         return path.endswith(_STATIC_EXTENSIONS)
     return bool(re.fullmatch(r"/v2/[0-9a-f-]{20,}/api\.js", path, re.I))
 

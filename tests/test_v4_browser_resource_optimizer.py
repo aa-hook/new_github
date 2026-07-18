@@ -22,6 +22,10 @@ PUBLIC_API = (
     "E8A75615-1CBA-5DFF-8032-D16BCF234E10/api.js"
 )
 PUBLIC_ASSET = "https://blizzard-api.arkoselabs.com/cdn/fc/assets/app.js?v=123"
+PUBLIC_GAME_CHUNK = (
+    "https://blizzard-api.arkoselabs.com/fc/assets/ec-game-core/game-core/"
+    "1.37.0/standard/68.chunk.4c37697ae6fccde3e043.js"
+)
 
 
 class FakeRequest:
@@ -84,6 +88,7 @@ def optimizer(tmp_path, fetcher, **kwargs):
 def test_only_public_arkose_assets_are_direct_candidates():
     assert is_public_static_candidate(PUBLIC_API)
     assert is_public_static_candidate(PUBLIC_ASSET)
+    assert is_public_static_candidate(PUBLIC_GAME_CHUNK)
     assert not is_public_static_candidate(
         "https://blizzard-api.arkoselabs.com/cdn/fc/assets/style-manager"
     )
@@ -98,6 +103,9 @@ def test_only_public_arkose_assets_are_direct_candidates():
     )
     assert not is_public_static_candidate(
         "https://blizzard-api.arkoselabs.com/fc/gt2/public_key"
+    )
+    assert not is_public_static_candidate(
+        PUBLIC_GAME_CHUNK + "?sessionToken=secret"
     )
     assert not is_public_static_candidate(
         "https://account.battle.net/static/main.js"
