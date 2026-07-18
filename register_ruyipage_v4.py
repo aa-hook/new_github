@@ -565,24 +565,28 @@ def stop_browser_optimizer(
     counts = dict(report.get("counts") or {})
     byte_counts = dict(report.get("bytes") or {})
     LOG.info(
-        "Browser traffic optimizer: directStatic=%.4f MiB cacheHit=%.4f MiB "
-        "estimatedProxyAvoided=%.4f MiB candidates=%s fallbacks=%s blocked=%s",
+        "Browser traffic optimizer: directStatic=%.4f MiB directImages=%.4f MiB "
+        "cacheHit=%.4f MiB estimatedProxyAvoided=%.4f MiB candidates=%s "
+        "imageFallbacks=%s staticFallbacks=%s blocked=%s",
         float(byte_counts.get("directStaticMiB") or 0.0),
+        float(byte_counts.get("directChallengeImageMiB") or 0.0),
         float(byte_counts.get("cacheHitMiB") or 0.0),
         float(byte_counts.get("estimatedProxyMiBAvoided") or 0.0),
         int(counts.get("publicStaticCandidates") or 0),
+        int(counts.get("directChallengeImageFallbacks") or 0),
         int(counts.get("directStaticFallbacks") or 0),
         int(counts.get("blockedRequests") or 0),
     )
     failures = dict(report.get("directFetchFailures") or {})
     if failures:
         LOG.info(
-            "Direct static fallback reasons: %s",
+            "Direct fetch fallback reasons: %s",
             sorted(failures.items(), key=lambda item: item[1], reverse=True)[:5],
         )
     for fallback in list(report.get("directFallbacks") or [])[:10]:
         LOG.info(
-            "Direct static fallback: hard=%s reason=%s url=%s",
+            "Direct fetch fallback: category=%s hard=%s reason=%s url=%s",
+            fallback.get("category") or "public-static",
             bool(fallback.get("hardFailure")),
             fallback.get("reason"),
             fallback.get("url"),
@@ -763,6 +767,9 @@ def solve_arkose_with_ruyi(
             direct_public_static=(
                 proxy.enabled and not bool(args.no_direct_public_static)
             ),
+            direct_challenge_images=(
+                proxy.enabled and bool(args.direct_challenge_images)
+            ),
             block_nonessential=not bool(args.no_resource_blocking),
             fetch_timeout=args.static_fetch_timeout,
             max_entry_bytes=max(1, int(args.static_cache_max_entry_mib * MIB)),
@@ -770,9 +777,10 @@ def solve_arkose_with_ruyi(
         )
         optimizer.start()
         LOG.info(
-            "Browser traffic optimizer enabled: publicStaticDirect=%s cache=%s "
-            "sessionBound=proxy",
+            "Browser traffic optimizer enabled: publicStaticDirect=%s "
+            "challengeImageDirect=%s cache=%s sessionControl=proxy",
             proxy.enabled and not bool(args.no_direct_public_static),
+            proxy.enabled and bool(args.direct_challenge_images),
             Path(args.static_cache_dir).expanduser().resolve(),
         )
 
@@ -879,6 +887,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="keep public static cache misses on the configured browser route",
     )
+    direct_images = parser.add_mutually_exclusive_group()
+    direct_images.add_argument(
+        "--direct-challenge-images",
+        dest="direct_challenge_images",
+        action="store_true",
+        default=True,
+        help="download signed Arkose challenge images runner-direct (default)",
+    )
+    direct_images.add_argument(
+        "--no-direct-challenge-images",
+        dest="direct_challenge_images",
+        action="store_false",
+        help="keep signed Arkose challenge images on the configured browser route",
+    )
     parser.add_argument("--static-fetch-timeout", type=float, default=8.0)
     parser.add_argument("--static-cache-max-entry-mib", type=float, default=8.0)
     parser.add_argument(
@@ -959,6 +981,9 @@ def main() -> int:
                     "proxyTrafficMeter": bool(proxy.enabled),
                     "publicStaticDirect": bool(
                         proxy.enabled and not args.no_direct_public_static
+                    ),
+                    "challengeImageDirect": bool(
+                        proxy.enabled and args.direct_challenge_images
                     ),
                     "staticCacheDir": str(Path(args.static_cache_dir).expanduser()),
                     "protocolImpersonate": args.protocol_impersonate,
@@ -1084,6 +1109,9 @@ def main() -> int:
                 "mode": "persistent-http-ruyipage-local-v11",
                 "registrationCountry": REGISTRATION_COUNTRY,
                 "countryProbe": bool(args.country_probe),
+                "challengeImageDirect": bool(
+                    proxy.enabled and args.direct_challenge_images
+                ),
                 "proxy": proxy.summary(),
                 "arkose": public_arkose_context(arkose),
                 "rankV11": {
@@ -1135,6 +1163,9 @@ def main() -> int:
             "outputDir": str(out),
             "registrationCountry": REGISTRATION_COUNTRY,
             "countryProbe": bool(args.country_probe),
+            "challengeImageDirect": bool(
+                proxy.enabled and args.direct_challenge_images
+            ),
             "proxy": proxy.summary(),
             "elapsedSeconds": time.perf_counter() - started,
         }

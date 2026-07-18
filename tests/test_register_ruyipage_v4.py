@@ -149,10 +149,15 @@ def test_public_static_optimizer_is_enabled_by_default_and_can_be_disabled(tmp_p
     disabled = parser.parse_args(
         ["--static-cache-dir", str(tmp_path), "--no-direct-public-static"]
     )
+    proxy_images = parser.parse_args(
+        ["--static-cache-dir", str(tmp_path), "--no-direct-challenge-images"]
+    )
 
     assert default.no_direct_public_static is False
+    assert default.direct_challenge_images is True
     assert default.static_cache_max_entry_mib == 8.0
     assert disabled.no_direct_public_static is True
+    assert proxy_images.direct_challenge_images is False
 
 
 def test_low_traffic_filter_keeps_arkose_images_and_blocks_only_nonessential_assets():

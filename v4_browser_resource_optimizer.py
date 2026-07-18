@@ -103,6 +103,13 @@ _REQUEST_HEADER_NAMES = {
     "user-agent",
 }
 _ALLOWED_VARY_HEADERS = {"accept-encoding", "origin"}
+_CHALLENGE_IMAGE_QUERY_NAMES = {
+    "challenge",
+    "expires",
+    "gametoken",
+    "sessiontoken",
+    "signature",
+}
 
 
 def _lower_headers(headers: Optional[Mapping[str, Any]]) -> dict[str, str]:
@@ -153,6 +160,28 @@ def is_public_static_candidate(url: str, method: str = "GET") -> bool:
     if path.startswith(("/cdn/fc/", "/fc/assets/")):
         return path.endswith(_STATIC_EXTENSIONS)
     return bool(re.fullmatch(r"/v2/[0-9a-f-]{20,}/api\.js", path, re.I))
+
+
+def is_direct_challenge_image_candidate(url: str, method: str = "GET") -> bool:
+    if str(method or "").upper() != "GET":
+        return False
+    parsed = urlsplit(str(url or ""))
+    if parsed.scheme.lower() != "https" or not _arkose_host(parsed.hostname or ""):
+        return False
+    if parsed.username or parsed.password or parsed.fragment:
+        return False
+    if parsed.path.lower() != "/rtig/image":
+        return False
+    return _CHALLENGE_IMAGE_QUERY_NAMES <= _normalized_query_names(url)
+
+
+def is_complete_jpeg(body: bytes) -> bool:
+    data = bytes(body or b"")
+    return (
+        len(data) >= 1024
+        and data.startswith(b"\xff\xd8")
+        and data.endswith(b"\xff\xd9")
+    )
 
 
 def public_cache_lifetime(headers: Mapping[str, Any]) -> int:
@@ -401,6 +430,22 @@ class DirectPublicStaticFetcher:
         self.session.close()
 
     def fetch(self, url: str, request_headers: Mapping[str, Any]) -> FetchOutcome:
+        return self._fetch(url, request_headers, ephemeral_image=False)
+
+    def fetch_ephemeral_image(
+        self,
+        url: str,
+        request_headers: Mapping[str, Any],
+    ) -> FetchOutcome:
+        return self._fetch(url, request_headers, ephemeral_image=True)
+
+    def _fetch(
+        self,
+        url: str,
+        request_headers: Mapping[str, Any],
+        *,
+        ephemeral_image: bool,
+    ) -> FetchOutcome:
         started = time.perf_counter()
         response = None
         headers = _lower_headers(request_headers)
@@ -430,12 +475,12 @@ class DirectPublicStaticFetcher:
                 for item in normalized.get("vary", "").split(",")
                 if item.strip()
             }
-            if vary_names - _ALLOWED_VARY_HEADERS:
+            if not ephemeral_image and vary_names - _ALLOWED_VARY_HEADERS:
                 return FetchOutcome(None, "unsupported-vary", time.perf_counter() - started)
 
-            lifetime = public_cache_lifetime(normalized)
-            replay_only = lifetime <= 0
-            if replay_only:
+            lifetime = 0 if ephemeral_image else public_cache_lifetime(normalized)
+            replay_only = ephemeral_image or lifetime <= 0
+            if replay_only and not ephemeral_image:
                 cache_control = normalized.get("cache-control", "").lower()
                 if any(
                     directive in cache_control
@@ -465,6 +510,30 @@ class DirectPublicStaticFetcher:
             body = b"".join(chunks)
             if not body:
                 return FetchOutcome(None, "empty-response", time.perf_counter() - started)
+            if ephemeral_image:
+                content_type = normalized.get("content-type", "").split(";", 1)[0].lower()
+                if content_type != "image/jpeg":
+                    return FetchOutcome(
+                        None,
+                        "challenge-image-not-jpeg",
+                        time.perf_counter() - started,
+                    )
+                if not is_complete_jpeg(body):
+                    return FetchOutcome(
+                        None,
+                        "challenge-image-incomplete",
+                        time.perf_counter() - started,
+                    )
+                if not normalized.get("content-encoding"):
+                    expected_length = 0
+                    with contextlib.suppress(TypeError, ValueError):
+                        expected_length = int(normalized.get("content-length") or 0)
+                    if expected_length > 0 and expected_length != len(body):
+                        return FetchOutcome(
+                            None,
+                            "challenge-image-length-mismatch",
+                            time.perf_counter() - started,
+                        )
 
             replay_headers = {
                 name: value
@@ -487,7 +556,11 @@ class DirectPublicStaticFetcher:
             )
             return FetchOutcome(
                 cached,
-                "ok-replay-only" if replay_only else "ok",
+                (
+                    "ok-ephemeral-image"
+                    if ephemeral_image
+                    else ("ok-replay-only" if replay_only else "ok")
+                ),
                 time.perf_counter() - started,
             )
         except requests.RequestException as exc:
@@ -510,6 +583,7 @@ class BrowserResourceOptimizer:
         *,
         proxy_enabled: bool,
         direct_public_static: bool = True,
+        direct_challenge_images: bool = True,
         block_nonessential: bool = True,
         fetch_timeout: float = 8.0,
         max_entry_bytes: int = 8 * MIB,
@@ -521,6 +595,7 @@ class BrowserResourceOptimizer:
         self.cache = StaticResponseCache(cache_dir, max_entry_bytes=max_entry_bytes)
         self.proxy_enabled = bool(proxy_enabled)
         self.direct_public_static = bool(direct_public_static)
+        self.direct_challenge_images = bool(direct_challenge_images)
         self.block_nonessential = bool(block_nonessential)
         self.direct_failure_limit = max(1, int(direct_failure_limit))
         self.should_block = should_block or (lambda _url: False)
@@ -540,6 +615,7 @@ class BrowserResourceOptimizer:
         self._direct_fallbacks: list[dict[str, Any]] = []
         self._direct_failures = 0
         self._direct_circuit_open = False
+        self._challenge_image_circuit_open = False
 
     def start(self) -> None:
         self.page.intercept.start(
@@ -573,6 +649,14 @@ class BrowserResourceOptimizer:
             request.fail()
             with self._lock:
                 self._counts["blockedRequests"] += 1
+            return
+
+        if is_direct_challenge_image_candidate(url, method):
+            self._handle_challenge_image_request(
+                request,
+                url=url,
+                request_id=request_id,
+            )
             return
 
         if is_session_bound_url(url):
@@ -677,6 +761,102 @@ class BrowserResourceOptimizer:
                             self._counts["directStaticCircuitOpened"] = 1
                 elif self._direct_circuit_open:
                     self._counts["directStaticCircuitBypasses"] += 1
+
+    def _handle_challenge_image_request(
+        self,
+        request: Any,
+        *,
+        url: str,
+        request_id: str,
+    ) -> None:
+        with self._lock:
+            self._counts["sessionBoundRequests"] += 1
+            self._counts["challengeImageCandidates"] += 1
+            circuit_open = self._challenge_image_circuit_open
+
+        direct_allowed = (
+            self.proxy_enabled
+            and self.direct_challenge_images
+            and not circuit_open
+        )
+        outcome: Optional[FetchOutcome] = None
+        response: Optional[CachedResponse] = None
+        if direct_allowed:
+            fetch = getattr(self.fetcher, "fetch_ephemeral_image", None)
+            if callable(fetch):
+                outcome = fetch(url, getattr(request, "headers", {}) or {})
+                response = outcome.response
+            else:
+                outcome = FetchOutcome(None, "ephemeral-fetch-unavailable", 0.0)
+
+        if response is not None:
+            try:
+                request.mock(
+                    response.body,
+                    status_code=response.status_code,
+                    headers=response.headers,
+                    reason_phrase=response.reason_phrase,
+                )
+            except Exception as exc:
+                with contextlib.suppress(Exception):
+                    request._handled = False
+                    request.continue_request()
+                with self._lock:
+                    self._counts["challengeImageMockFailures"] += 1
+                    self._counts["directChallengeImageFallbacks"] += 1
+                    self._counts["proxyPassThroughRequests"] += int(self.proxy_enabled)
+                    reason = f"mock-{type(exc).__name__}: {exc}"[:240]
+                    self._failure_reasons[f"challenge-image:{reason}"[:240]] += 1
+                    self._direct_fallbacks.append(
+                        {
+                            "url": sanitized_url(url),
+                            "reason": reason,
+                            "hardFailure": True,
+                            "category": "challenge-image",
+                        }
+                    )
+                    self._challenge_image_circuit_open = True
+                    self._counts["directChallengeImageCircuitOpened"] = 1
+                return
+
+            with self._lock:
+                if request_id:
+                    self._local_request_ids.add(request_id)
+                self._counts["directChallengeImageFetches"] += 1
+                self._bytes["directChallengeImageBytes"] += len(response.body)
+                self._bytes["directChallengeImageFetchMillis"] += int(
+                    1000 * float(outcome.elapsed_seconds if outcome else 0.0)
+                )
+                self._bytes["estimatedProxyBytesAvoided"] += len(response.body)
+                self._record_locked(
+                    url=url,
+                    route="direct-challenge-image",
+                    status=response.status_code,
+                    content_type=response.headers.get("content-type", ""),
+                    wire_bytes=len(response.body),
+                    decoded_bytes=len(response.body),
+                )
+            return
+
+        request.continue_request()
+        with self._lock:
+            self._counts["proxyPassThroughRequests"] += int(self.proxy_enabled)
+            if direct_allowed:
+                self._counts["directChallengeImageFallbacks"] += 1
+                reason = outcome.reason if outcome is not None else "unknown"
+                self._failure_reasons[f"challenge-image:{reason}"[:240]] += 1
+                self._direct_fallbacks.append(
+                    {
+                        "url": sanitized_url(url),
+                        "reason": reason[:240],
+                        "hardFailure": True,
+                        "category": "challenge-image",
+                    }
+                )
+                self._challenge_image_circuit_open = True
+                self._counts["directChallengeImageCircuitOpened"] = 1
+            elif circuit_open:
+                self._counts["directChallengeImageCircuitBypasses"] += 1
 
     def _handle_response(self, request: Any) -> None:
         url = str(getattr(request, "url", "") or "")
@@ -845,9 +1025,10 @@ class BrowserResourceOptimizer:
         )[:30]
         return {
             "enabled": True,
-            "mode": "quality-first-public-static-direct-cache",
+            "mode": "bandwidth-first-challenge-images-and-public-static-direct",
             "proxyEnabled": self.proxy_enabled,
             "directPublicStaticEnabled": self.direct_public_static,
+            "directChallengeImagesEnabled": self.direct_challenge_images,
             "blockNonessentialEnabled": self.block_nonessential,
             "cacheDir": str(self.cache.root),
             "durationSeconds": round(max(0.0, time.time() - self._started_at), 3),
@@ -855,6 +1036,10 @@ class BrowserResourceOptimizer:
             "bytes": {
                 **byte_counts,
                 "directStaticMiB": round(byte_counts.get("directStaticBytes", 0) / MIB, 4),
+                "directChallengeImageMiB": round(
+                    byte_counts.get("directChallengeImageBytes", 0) / MIB,
+                    4,
+                ),
                 "cacheHitMiB": round(byte_counts.get("cacheHitBytes", 0) / MIB, 4),
                 "estimatedProxyMiBAvoided": round(
                     byte_counts.get("estimatedProxyBytesAvoided", 0) / MIB, 4

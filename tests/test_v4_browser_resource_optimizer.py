@@ -11,6 +11,7 @@ from v4_browser_resource_optimizer import (
     DirectPublicStaticFetcher,
     FetchOutcome,
     StaticResponseCache,
+    is_direct_challenge_image_candidate,
     is_public_static_candidate,
     is_session_bound_url,
     public_cache_lifetime,
@@ -25,6 +26,11 @@ PUBLIC_ASSET = "https://blizzard-api.arkoselabs.com/cdn/fc/assets/app.js?v=123"
 PUBLIC_GAME_CHUNK = (
     "https://blizzard-api.arkoselabs.com/fc/assets/ec-game-core/game-core/"
     "1.37.0/standard/68.chunk.4c37697ae6fccde3e043.js"
+)
+CHALLENGE_IMAGE = (
+    "https://blizzard-api.arkoselabs.com/rtig/image?"
+    "challenge=0&expires=9999999999&gameToken=game-secret&"
+    "sessionToken=session-secret&signature=signature-secret"
 )
 
 
@@ -109,6 +115,17 @@ def test_only_public_arkose_assets_are_direct_candidates():
     )
     assert not is_public_static_candidate(
         "https://account.battle.net/static/main.js"
+    )
+
+
+def test_only_complete_signed_arkose_images_are_ephemeral_direct_candidates():
+    assert is_direct_challenge_image_candidate(CHALLENGE_IMAGE)
+    assert not is_direct_challenge_image_candidate(CHALLENGE_IMAGE, "POST")
+    assert not is_direct_challenge_image_candidate(
+        CHALLENGE_IMAGE.replace("signature=signature-secret", "missing=1")
+    )
+    assert not is_direct_challenge_image_candidate(
+        CHALLENGE_IMAGE.replace("blizzard-api.arkoselabs.com", "example.test")
     )
 
 
@@ -209,21 +226,75 @@ def test_disk_cache_does_not_cross_origin_variants(tmp_path):
     assert cache.get(PUBLIC_API, {"Origin": "https://other.example"}) is None
 
 
-def test_session_bound_image_always_uses_browser_proxy(tmp_path):
+def test_session_bound_image_uses_browser_proxy_when_direct_mode_is_disabled(tmp_path):
     fetcher = FakeFetcher(None)
-    app = optimizer(tmp_path, fetcher)
-    url = (
-        "https://blizzard-api.arkoselabs.com/rtig/image?"
-        "challenge=0&gameToken=game-secret&sessionToken=session-secret&signature=sig"
-    )
+    app = optimizer(tmp_path, fetcher, direct_challenge_images=False)
 
-    request = FakeRequest(url)
+    request = FakeRequest(CHALLENGE_IMAGE)
     app._handle_request(request)
 
-    assert is_session_bound_url(url)
+    assert is_session_bound_url(CHALLENGE_IMAGE)
     assert request.action == "continue-request"
     assert fetcher.calls == []
     assert app.report()["counts"]["sessionBoundRequests"] == 1
+
+
+def test_signed_challenge_image_is_fetched_direct_and_never_cached(tmp_path):
+    jpeg = b"\xff\xd8" + (b"image-fixture" * 100) + b"\xff\xd9"
+    response = CachedResponse(
+        body=jpeg,
+        headers={"content-type": "image/jpeg", "content-length": str(len(jpeg))},
+        expires_at=0.0,
+    )
+
+    class ImageFetcher(FakeFetcher):
+        def fetch_ephemeral_image(self, url, headers):
+            self.calls.append((url, dict(headers)))
+            return FetchOutcome(self.response, "ok-ephemeral-image", 0.01)
+
+    fetcher = ImageFetcher(response)
+    app = optimizer(tmp_path, fetcher)
+    request = FakeRequest(CHALLENGE_IMAGE, request_id="challenge-image")
+
+    app._handle_request(request)
+
+    assert request.action == "mock"
+    assert request.mocked[0] == jpeg
+    assert len(fetcher.calls) == 1
+    assert list(tmp_path.glob("*.bin")) == []
+    report = app.report()
+    assert report["counts"]["directChallengeImageFetches"] == 1
+    assert report["bytes"]["directChallengeImageBytes"] == len(jpeg)
+    assert report["bytes"]["directChallengeImageMiB"] > 0
+    assert report["topResponses"][0]["route"] == "direct-challenge-image"
+    assert "game-secret" not in str(report)
+    assert "session-secret" not in str(report)
+
+
+def test_challenge_image_direct_failure_falls_back_and_opens_circuit(tmp_path):
+    class FailingImageFetcher(FakeFetcher):
+        def fetch_ephemeral_image(self, url, headers):
+            self.calls.append((url, dict(headers)))
+            return FetchOutcome(None, "status-403", 0.01)
+
+    fetcher = FailingImageFetcher(None)
+    app = optimizer(tmp_path, fetcher)
+    first = FakeRequest(CHALLENGE_IMAGE, request_id="first")
+    second = FakeRequest(
+        CHALLENGE_IMAGE.replace("challenge=0", "challenge=1"),
+        request_id="second",
+    )
+
+    app._handle_request(first)
+    app._handle_request(second)
+
+    assert first.action == "continue-request"
+    assert second.action == "continue-request"
+    assert len(fetcher.calls) == 1
+    report = app.report()
+    assert report["counts"]["directChallengeImageFallbacks"] == 1
+    assert report["counts"]["directChallengeImageCircuitOpened"] == 1
+    assert report["counts"]["directChallengeImageCircuitBypasses"] == 1
 
 
 def test_direct_failure_circuit_prevents_repeated_runner_timeouts(tmp_path):
@@ -354,18 +425,29 @@ def test_collector_binary_body_is_used_when_content_length_is_missing(tmp_path):
 
 def test_direct_fetcher_ignores_environment_proxy(tmp_path, monkeypatch):
     body = b"window.fixture = true;"
+    challenge_body = b"\xff\xd8" + (b"challenge" * 200) + b"\xff\xd9"
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            payload = challenge_body if self.path == "/challenge.jpg" else body
             self.send_response(200)
-            self.send_header("Content-Type", "application/javascript")
+            self.send_header(
+                "Content-Type",
+                (
+                    "image/jpeg"
+                    if self.path == "/challenge.jpg"
+                    else "application/javascript"
+                ),
+            )
             if self.path == "/asset.js":
                 self.send_header("Cache-Control", "public, max-age=3600")
             elif self.path == "/validator.js":
                 self.send_header("ETag", '"validator-fixture"')
-            self.send_header("Content-Length", str(len(body)))
+            elif self.path == "/challenge.jpg":
+                self.send_header("Cache-Control", "private, no-store")
+            self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
-            self.wfile.write(body)
+            self.wfile.write(payload)
 
         def log_message(self, _format, *_args):
             return
@@ -390,6 +472,10 @@ def test_direct_fetcher_ignores_environment_proxy(tmp_path, monkeypatch):
             f"http://127.0.0.1:{server.server_port}/no-validator.js",
             {"User-Agent": "Firefox/Test"},
         )
+        challenge = fetcher.fetch_ephemeral_image(
+            f"http://127.0.0.1:{server.server_port}/challenge.jpg",
+            {"User-Agent": "Firefox/Test"},
+        )
     finally:
         fetcher.close()
         server.shutdown()
@@ -405,3 +491,6 @@ def test_direct_fetcher_ignores_environment_proxy(tmp_path, monkeypatch):
     assert replay_only.response.expires_at == 0.0
     assert rejected.reason == "response-has-no-validator"
     assert rejected.response is None
+    assert challenge.reason == "ok-ephemeral-image"
+    assert challenge.response is not None
+    assert challenge.response.body == challenge_body

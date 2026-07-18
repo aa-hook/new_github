@@ -65,6 +65,11 @@ socks5://username:password@host:port
 - Firefox GMP/OpenH264 and Widevine auto-downloads are disabled. Their Mozilla
   update hosts bypass the configured proxy as a fallback, so browser component
   downloads cannot consume metered registration proxy traffic.
+- Signed Arkose `/rtig/image` responses are fetched runner-direct and injected
+  into the browser without persistent caching. Status, content type, and JPEG
+  integrity are checked first; any failure falls back to the proxy and opens a
+  per-run circuit breaker. Use `--no-direct-challenge-images` to keep all
+  challenge images on the proxy route.
 - Browser fonts, media, and common analytics hosts are blocked; Arkose assets and challenge images remain enabled.
 - Per-wave screenshots are disabled unless `--debug-screenshots` is supplied.
 - V11 is loaded once per matrix job and reused across all challenge waves and retries.
