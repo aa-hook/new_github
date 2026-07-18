@@ -16,7 +16,7 @@ import re
 import threading
 import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
@@ -92,6 +92,7 @@ _REPLAY_HEADER_NAMES = {
     "expires",
     "last-modified",
     "timing-allow-origin",
+    "vary",
     "x-content-type-options",
 }
 _REQUEST_HEADER_NAMES = {
@@ -101,6 +102,7 @@ _REQUEST_HEADER_NAMES = {
     "referer",
     "user-agent",
 }
+_ALLOWED_VARY_HEADERS = {"accept-encoding", "origin"}
 
 
 def _lower_headers(headers: Optional[Mapping[str, Any]]) -> dict[str, str]:
@@ -149,9 +151,7 @@ def is_public_static_candidate(url: str, method: str = "GET") -> bool:
 
     path = parsed.path.lower()
     if path.startswith("/cdn/fc/"):
-        return path.endswith(_STATIC_EXTENSIONS) or path.rstrip("/") == (
-            "/cdn/fc/assets/style-manager"
-        )
+        return path.endswith(_STATIC_EXTENSIONS)
     return bool(re.fullmatch(r"/v2/[0-9a-f-]{20,}/api\.js", path, re.I))
 
 
@@ -167,11 +167,19 @@ def public_cache_lifetime(headers: Mapping[str, Any]) -> int:
         for item in normalized.get("vary", "").split(",")
         if item.strip()
     }
-    if vary - {"accept-encoding"}:
+    if vary - _ALLOWED_VARY_HEADERS:
         return 0
 
-    match = re.search(r"(?:^|,)\s*(?:s-maxage|max-age)\s*=\s*\"?(\d+)", cache_control)
-    max_age = int(match.group(1)) if match else 0
+    def directive_age(name: str) -> Optional[int]:
+        match = re.search(
+            rf"(?:^|,)\s*{re.escape(name)}\s*=\s*\"?(\d+)",
+            cache_control,
+        )
+        return int(match.group(1)) if match else None
+
+    shared_age = directive_age("s-maxage")
+    browser_age = directive_age("max-age")
+    max_age = shared_age if shared_age is not None else (browser_age or 0)
     if "immutable" in cache_control and max_age <= 0:
         max_age = 7 * 24 * 60 * 60
     if max_age <= 0:
@@ -246,6 +254,7 @@ class CachedResponse:
     status_code: int = 200
     reason_phrase: str = "OK"
     expires_at: float = 0.0
+    vary_request_headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -253,6 +262,25 @@ class FetchOutcome:
     response: Optional[CachedResponse]
     reason: str
     elapsed_seconds: float
+
+
+def is_hard_direct_failure(reason: str) -> bool:
+    normalized = str(reason or "").strip().lower()
+    status_match = re.fullmatch(r"status-(\d+)", normalized)
+    if status_match:
+        status = int(status_match.group(1))
+        return status in {401, 403, 407, 408, 425, 429} or status >= 500
+    return normalized.startswith(
+        (
+            "connectionerror:",
+            "connecttimeout:",
+            "contentdecodingerror:",
+            "proxyerror:",
+            "readtimeout:",
+            "retryerror:",
+            "sslerror:",
+        )
+    )
 
 
 class StaticResponseCache:
@@ -276,7 +304,11 @@ class StaticResponseCache:
         key = self.key(url)
         return self.root / f"{key}.bin", self.root / f"{key}.json"
 
-    def get(self, url: str) -> Optional[CachedResponse]:
+    def get(
+        self,
+        url: str,
+        request_headers: Optional[Mapping[str, Any]] = None,
+    ) -> Optional[CachedResponse]:
         body_path, metadata_path = self._paths(url)
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -294,12 +326,23 @@ class StaticResponseCache:
                 return None
             if hashlib.sha256(body).hexdigest() != metadata.get("sha256"):
                 return None
+            vary_request_headers = {
+                str(k).lower(): str(v)
+                for k, v in dict(metadata.get("varyRequestHeaders") or {}).items()
+            }
+            current_headers = _lower_headers(request_headers)
+            if any(
+                current_headers.get(name, "") != expected
+                for name, expected in vary_request_headers.items()
+            ):
+                return None
             return CachedResponse(
                 body=body,
                 headers={str(k): str(v) for k, v in dict(metadata.get("headers") or {}).items()},
                 status_code=int(metadata.get("statusCode") or 200),
                 reason_phrase=str(metadata.get("reasonPhrase") or "OK"),
                 expires_at=expires_at,
+                vary_request_headers=vary_request_headers,
             )
         except (OSError, ValueError, TypeError):
             return None
@@ -321,6 +364,7 @@ class StaticResponseCache:
             "sha256": hashlib.sha256(response.body).hexdigest(),
             "storedAt": time.time(),
             "expiresAt": response.expires_at,
+            "varyRequestHeaders": response.vary_request_headers,
         }
         try:
             body_tmp.write_bytes(response.body)
@@ -399,12 +443,22 @@ class DirectPublicStaticFetcher:
             }
             replay_headers.pop("content-encoding", None)
             replay_headers["content-length"] = str(len(body))
+            vary_names = {
+                item.strip().lower()
+                for item in normalized.get("vary", "").split(",")
+                if item.strip()
+            }
             cached = CachedResponse(
                 body=body,
                 headers=replay_headers,
                 status_code=200,
                 reason_phrase=str(response.reason or "OK"),
                 expires_at=time.time() + lifetime,
+                vary_request_headers={
+                    name: outgoing.get(name, "")
+                    for name in vary_names
+                    if name != "accept-encoding"
+                },
             )
             return FetchOutcome(cached, "ok", time.perf_counter() - started)
         except requests.RequestException as exc:
@@ -454,6 +508,7 @@ class BrowserResourceOptimizer:
         self._bytes: Counter[str] = Counter()
         self._failure_reasons: Counter[str] = Counter()
         self._resources: list[dict[str, Any]] = []
+        self._direct_fallbacks: list[dict[str, Any]] = []
         self._direct_failures = 0
         self._direct_circuit_open = False
 
@@ -508,12 +563,13 @@ class BrowserResourceOptimizer:
             self._counts["publicStaticCandidates"] += 1
         key_lock = self.cache.lock_for(url)
         with key_lock:
-            cached = self.cache.get(url)
+            request_headers = getattr(request, "headers", {}) or {}
+            cached = self.cache.get(url, request_headers)
             route = "cache"
             outcome: Optional[FetchOutcome] = None
             direct_allowed = self.direct_public_static and not self._direct_circuit_open
             if cached is None and direct_allowed:
-                outcome = self.fetcher.fetch(url, getattr(request, "headers", {}) or {})
+                outcome = self.fetcher.fetch(url, request_headers)
                 cached = outcome.response
                 route = "direct-public-static"
                 if cached is not None:
@@ -567,10 +623,24 @@ class BrowserResourceOptimizer:
                 self._counts["proxyPassThroughRequests"] += int(self.proxy_enabled)
                 if outcome is not None:
                     self._failure_reasons[outcome.reason[:240]] += 1
-                    self._direct_failures += 1
-                    if self._direct_failures >= self.direct_failure_limit:
-                        self._direct_circuit_open = True
-                        self._counts["directStaticCircuitOpened"] = 1
+                    hard_failure = is_hard_direct_failure(outcome.reason)
+                    self._counts[
+                        "directStaticHardFailures"
+                        if hard_failure
+                        else "directStaticPolicyFallbacks"
+                    ] += 1
+                    self._direct_fallbacks.append(
+                        {
+                            "url": sanitized_url(url),
+                            "reason": outcome.reason[:240],
+                            "hardFailure": hard_failure,
+                        }
+                    )
+                    if hard_failure:
+                        self._direct_failures += 1
+                        if self._direct_failures >= self.direct_failure_limit:
+                            self._direct_circuit_open = True
+                            self._counts["directStaticCircuitOpened"] = 1
                 elif self._direct_circuit_open:
                     self._counts["directStaticCircuitBypasses"] += 1
 
@@ -618,6 +688,16 @@ class BrowserResourceOptimizer:
                     status_code=status,
                     reason_phrase="OK",
                     expires_at=time.time() + public_cache_lifetime(headers),
+                    vary_request_headers={
+                        name: _lower_headers(getattr(request, "headers", {}) or {}).get(
+                            name, ""
+                        )
+                        for name in {
+                            item.strip().lower()
+                            for item in headers.get("vary", "").split(",")
+                            if item.strip() and item.strip().lower() != "accept-encoding"
+                        }
+                    },
                 ),
             )
             with self._lock:
@@ -709,6 +789,7 @@ class BrowserResourceOptimizer:
             counts = dict(self._counts)
             byte_counts = dict(self._bytes)
             failures = dict(self._failure_reasons)
+            direct_fallbacks = [dict(item) for item in self._direct_fallbacks]
 
         by_host: dict[str, dict[str, int]] = defaultdict(lambda: {"requests": 0, "bytes": 0})
         by_type: dict[str, dict[str, int]] = defaultdict(lambda: {"requests": 0, "bytes": 0})
@@ -746,6 +827,7 @@ class BrowserResourceOptimizer:
                 ),
             },
             "directFetchFailures": failures,
+            "directFallbacks": direct_fallbacks[:30],
             "byHost": dict(sorted(by_host.items())),
             "byResourceType": dict(sorted(by_type.items())),
             "byRoute": dict(sorted(by_route.items())),

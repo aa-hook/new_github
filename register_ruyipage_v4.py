@@ -335,6 +335,19 @@ def stop_browser_optimizer(
         int(counts.get("directStaticFallbacks") or 0),
         int(counts.get("blockedRequests") or 0),
     )
+    failures = dict(report.get("directFetchFailures") or {})
+    if failures:
+        LOG.info(
+            "Direct static fallback reasons: %s",
+            sorted(failures.items(), key=lambda item: item[1], reverse=True)[:5],
+        )
+    for fallback in list(report.get("directFallbacks") or [])[:5]:
+        LOG.info(
+            "Direct static fallback: hard=%s reason=%s url=%s",
+            bool(fallback.get("hardFailure")),
+            fallback.get("reason"),
+            fallback.get("url"),
+        )
     return report
 
 

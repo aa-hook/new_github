@@ -10,6 +10,7 @@ from v4_browser_resource_optimizer import (
     CachedResponse,
     DirectPublicStaticFetcher,
     FetchOutcome,
+    StaticResponseCache,
     is_public_static_candidate,
     is_session_bound_url,
     public_cache_lifetime,
@@ -83,7 +84,7 @@ def optimizer(tmp_path, fetcher, **kwargs):
 def test_only_public_arkose_assets_are_direct_candidates():
     assert is_public_static_candidate(PUBLIC_API)
     assert is_public_static_candidate(PUBLIC_ASSET)
-    assert is_public_static_candidate(
+    assert not is_public_static_candidate(
         "https://blizzard-api.arkoselabs.com/cdn/fc/assets/style-manager"
     )
     assert not is_public_static_candidate(
@@ -110,7 +111,15 @@ def test_only_public_arkose_assets_are_direct_candidates():
         ({"cache-control": "public, max-age=31536000, immutable"}, True),
         ({"cache-control": "private, max-age=3600"}, False),
         ({"cache-control": "public, max-age=3600", "set-cookie": "x=1"}, False),
-        ({"cache-control": "public, max-age=3600", "vary": "Origin"}, False),
+        ({"cache-control": "public, max-age=3600", "vary": "Origin"}, True),
+        (
+            {
+                "cache-control": "public, max-age=0, s-maxage=31536000",
+                "vary": "Accept-Encoding, Origin",
+            },
+            True,
+        ),
+        ({"cache-control": "public, max-age=3600", "vary": "Cookie"}, False),
         ({"cache-control": "max-age=0"}, False),
     ],
 )
@@ -145,6 +154,26 @@ def test_direct_public_response_is_mocked_then_reused_from_disk_cache(tmp_path):
     assert report["bytes"]["estimatedProxyBytesAvoided"] == 44
 
 
+def test_disk_cache_does_not_cross_origin_variants(tmp_path):
+    cache = StaticResponseCache(tmp_path)
+    payload = CachedResponse(
+        body=b"origin-specific",
+        headers={
+            "content-type": "application/javascript",
+            "cache-control": "public, max-age=3600",
+            "vary": "Origin",
+        },
+        expires_at=9999999999,
+        vary_request_headers={"origin": "https://account.battle.net"},
+    )
+    assert cache.put(PUBLIC_API, payload)
+
+    assert cache.get(
+        PUBLIC_API, {"Origin": "https://account.battle.net"}
+    ) is not None
+    assert cache.get(PUBLIC_API, {"Origin": "https://other.example"}) is None
+
+
 def test_session_bound_image_always_uses_browser_proxy(tmp_path):
     fetcher = FakeFetcher(None)
     app = optimizer(tmp_path, fetcher)
@@ -169,7 +198,7 @@ def test_direct_failure_circuit_prevents_repeated_runner_timeouts(tmp_path):
 
         def fetch(self, _url, _headers):
             self.calls += 1
-            return FetchOutcome(None, "connect-timeout", 3.0)
+            return FetchOutcome(None, "ConnectTimeout: timed out", 3.0)
 
     fetcher = FailingFetcher()
     app = optimizer(tmp_path, fetcher, direct_failure_limit=2)
@@ -186,6 +215,31 @@ def test_direct_failure_circuit_prevents_repeated_runner_timeouts(tmp_path):
     counts = app.report()["counts"]
     assert counts["directStaticCircuitOpened"] == 1
     assert counts["directStaticCircuitBypasses"] == 2
+
+
+def test_cache_policy_fallbacks_do_not_open_transport_circuit(tmp_path):
+    class PolicyFallbackFetcher:
+        def __init__(self):
+            self.calls = 0
+
+        def fetch(self, _url, _headers):
+            self.calls += 1
+            return FetchOutcome(None, "response-not-public-cacheable", 0.01)
+
+    fetcher = PolicyFallbackFetcher()
+    app = optimizer(tmp_path, fetcher, direct_failure_limit=2)
+    requests = [
+        FakeRequest(f"https://blizzard-api.arkoselabs.com/cdn/fc/assets/{index}.js")
+        for index in range(4)
+    ]
+
+    for request in requests:
+        app._handle_request(request)
+
+    assert fetcher.calls == 4
+    counts = app.report()["counts"]
+    assert counts["directStaticPolicyFallbacks"] == 4
+    assert counts.get("directStaticCircuitOpened", 0) == 0
 
 
 def test_response_report_redacts_all_query_values(tmp_path):
