@@ -92,5 +92,14 @@ def test_http_connect_is_forwarded_and_all_upstream_socket_bytes_are_counted():
     assert report["activeConnections"] == 0
     assert report["failures"] == 0
     assert report["upstreamProxy"] == f"http://{host}:{port}"
+    assert len(report["targets"]) == 1
+    target = report["targets"][0]
+    assert target["target"] == "target.example:443"
+    assert target["uploadBytes"] == report["uploadBytes"]
+    assert target["downloadBytes"] == report["downloadBytes"]
+    assert target["totalBytes"] == report["totalBytes"]
+    assert target["connections"] == 1
+    assert target["activeConnections"] == 0
+    assert target["failures"] == 0
     assert "user" not in str(report)
     assert "secret" not in str(report)

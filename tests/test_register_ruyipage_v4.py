@@ -42,11 +42,30 @@ def test_ruyi_launch_uses_proxy_but_never_logs_credentials(tmp_path, monkeypatch
         def set_bypass_csp(self, enabled):
             calls["bypass"] = enabled
 
-    def fake_launch(**kwargs):
-        calls["kwargs"] = kwargs
+    class FakeOptions:
+        def __init__(self):
+            self.preferences = {}
+
+        def quick_start(self, **kwargs):
+            calls["kwargs"] = kwargs
+
+        def set_pref(self, key, value):
+            self.preferences[key] = value
+
+        def set_browser_path(self, value):
+            calls["browser_path"] = value
+
+    def fake_page(options):
+        calls["preferences"] = dict(options.preferences)
         return FakePage()
 
-    monkeypatch.setattr(app.base.ruyipage, "launch", fake_launch)
+    monkeypatch.setattr(app.base.ruyipage, "FirefoxOptions", FakeOptions)
+    monkeypatch.setattr(app.base.ruyipage, "FirefoxPage", fake_page)
+    monkeypatch.setattr(
+        app.base.ruyipage,
+        "resolve_firefox_path",
+        lambda _path: "/runtime/firefox",
+    )
     proxy = app.parse_proxy("proxy.test:8080:user:secret")
 
     app.launch_ruyi_browser(
@@ -54,6 +73,10 @@ def test_ruyi_launch_uses_proxy_but_never_logs_credentials(tmp_path, monkeypatch
     )
 
     assert calls["kwargs"]["proxy"] == "http://user:secret@proxy.test:8080"
+    assert calls["preferences"] == app._FIREFOX_LOW_TRAFFIC_PREFS
+    assert calls["preferences"]["services.settings.server"] == "data:,"
+    assert calls["preferences"]["network.connectivity-service.enabled"] is False
+    assert calls["browser_path"] == "/runtime/firefox"
     assert calls["bypass"] is True
     assert "secret" not in caplog.text
     assert "user" not in caplog.text

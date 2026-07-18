@@ -209,6 +209,40 @@ _BLOCKED_EXTENSIONS = (
     ".mp3",
     ".wav",
 )
+_FIREFOX_LOW_TRAFFIC_PREFS: dict[str, Any] = {
+    "app.normandy.api_url": "",
+    "app.normandy.enabled": False,
+    "app.shield.optoutstudies.enabled": False,
+    "app.update.auto": False,
+    "app.update.disabledForTesting": True,
+    "browser.discovery.enabled": False,
+    "browser.newtabpage.activity-stream.feeds.snippets": False,
+    "browser.safebrowsing.downloads.enabled": False,
+    "browser.safebrowsing.malware.enabled": False,
+    "browser.safebrowsing.phishing.enabled": False,
+    "browser.search.update": False,
+    "browser.startup.homepage": "about:blank",
+    "browser.startup.page": 0,
+    "datareporting.healthreport.service.enabled": False,
+    "datareporting.healthreport.uploadEnabled": False,
+    "extensions.blocklist.enabled": False,
+    "extensions.getAddons.cache.enabled": False,
+    "extensions.systemAddon.update.enabled": False,
+    "extensions.update.enabled": False,
+    "network.captive-portal-service.enabled": False,
+    "network.connectivity-service.enabled": False,
+    "network.dns.disablePrefetch": True,
+    "network.http.speculative-parallel-limit": 0,
+    "network.predictor.enabled": False,
+    "network.prefetch-next": False,
+    "security.remote_settings.crlite_filters.enabled": False,
+    "security.remote_settings.intermediates.enabled": False,
+    "services.settings.server": "data:,",
+    "toolkit.telemetry.archive.enabled": False,
+    "toolkit.telemetry.enabled": False,
+    "toolkit.telemetry.server": "data:,",
+    "toolkit.telemetry.unified": False,
+}
 
 
 def should_block_resource(url: str) -> bool:
@@ -251,16 +285,47 @@ def launch_ruyi_browser(
         args.headless,
         proxy.display,
     )
-    page = base.ruyipage.launch(
-        headless=bool(args.headless),
-        proxy=runtime_proxy_url if runtime_proxy_url is not None else proxy.url,
-        window_size=(1920, 1080),
-        timeout_page_load=60,
-        timeout_script=60,
-        close_on_exit=True,
-        failure_snapshot=True,
-        snapshot_dir=str(Path(args.output_dir) / "_ruyi_failure_snapshots"),
-    )
+    launch_proxy = runtime_proxy_url if runtime_proxy_url is not None else proxy.url
+    ruyi = base.ruyipage
+    options_type = getattr(ruyi, "FirefoxOptions", None)
+    page_type = getattr(ruyi, "FirefoxPage", None)
+    if callable(options_type) and callable(page_type):
+        options = options_type()
+        options.quick_start(
+            headless=bool(args.headless),
+            proxy=launch_proxy,
+            window_size=(1920, 1080),
+            timeout_page_load=60,
+            timeout_script=60,
+            close_on_exit=True,
+            failure_snapshot=True,
+            snapshot_dir=str(Path(args.output_dir) / "_ruyi_failure_snapshots"),
+        )
+        for key, value in _FIREFOX_LOW_TRAFFIC_PREFS.items():
+            options.set_pref(key, value)
+        resolver = getattr(ruyi, "resolve_firefox_path", None)
+        browser_path = resolver(None) if callable(resolver) else None
+        if browser_path:
+            options.set_browser_path(browser_path)
+        page = page_type(options)
+        LOG.info(
+            "Firefox startup background network disabled: preferences=%s",
+            len(_FIREFOX_LOW_TRAFFIC_PREFS),
+        )
+    else:
+        LOG.warning(
+            "RuyiPage options API unavailable; using launch() without startup preferences"
+        )
+        page = ruyi.launch(
+            headless=bool(args.headless),
+            proxy=launch_proxy,
+            window_size=(1920, 1080),
+            timeout_page_load=60,
+            timeout_script=60,
+            close_on_exit=True,
+            failure_snapshot=True,
+            snapshot_dir=str(Path(args.output_dir) / "_ruyi_failure_snapshots"),
+        )
     with contextlib.suppress(Exception):
         page.set_bypass_csp(True)
     return page
@@ -416,6 +481,21 @@ def log_proxy_traffic_phases(report: Mapping[str, Any]) -> None:
             "Proxy traffic unaccounted: %.4f MiB bytes=%s",
             float(report.get("unaccountedMiB") or 0.0),
             int(report.get("unaccountedBytes") or 0),
+        )
+
+
+def log_proxy_traffic_targets(report: Mapping[str, Any]) -> None:
+    for item in list(report.get("targets") or [])[:10]:
+        LOG.info(
+            "Proxy traffic target %s: upload=%.4f MiB download=%.4f MiB "
+            "total=%.4f MiB bytes=%s connections=%s failures=%s",
+            item.get("target"),
+            float(item.get("uploadMiB") or 0.0),
+            float(item.get("downloadMiB") or 0.0),
+            float(item.get("totalMiB") or 0.0),
+            int(item.get("totalBytes") or 0),
+            int(item.get("connections") or 0),
+            int(item.get("failures") or 0),
         )
 
 
@@ -1052,6 +1132,7 @@ def main() -> int:
                 )
                 write_proxy_traffic_phase_report(out, phase_report)
                 log_proxy_traffic_phases(phase_report)
+                log_proxy_traffic_targets(report)
                 LOG.info(
                     "Proxy traffic total: upload=%.4f MiB download=%.4f MiB "
                     "total=%.4f MiB bytes=%s connections=%s failures=%s",

@@ -67,27 +67,51 @@ class TrafficCounters:
         self.active_connections = 0
         self.failures = 0
         self.errors: list[str] = []
+        self.targets: dict[str, dict[str, int]] = {}
         self._lock = threading.Lock()
         self._idle = threading.Condition(self._lock)
 
-    def add_upload(self, size: int) -> None:
+    def _target_locked(self, target: str) -> dict[str, int]:
+        key = str(target or "unclassified")
+        return self.targets.setdefault(
+            key,
+            {
+                "uploadBytes": 0,
+                "downloadBytes": 0,
+                "connections": 0,
+                "activeConnections": 0,
+                "failures": 0,
+            },
+        )
+
+    def add_upload(self, size: int, target: str = "unclassified") -> None:
         if size > 0:
             with self._lock:
                 self.upload_bytes += int(size)
+                self._target_locked(target)["uploadBytes"] += int(size)
 
-    def add_download(self, size: int) -> None:
+    def add_download(self, size: int, target: str = "unclassified") -> None:
         if size > 0:
             with self._lock:
                 self.download_bytes += int(size)
+                self._target_locked(target)["downloadBytes"] += int(size)
 
-    def add_connection(self) -> None:
+    def add_connection(self, target: str = "unclassified") -> None:
         with self._lock:
             self.connections += 1
             self.active_connections += 1
+            target_counter = self._target_locked(target)
+            target_counter["connections"] += 1
+            target_counter["activeConnections"] += 1
 
-    def finish_connection(self) -> None:
+    def finish_connection(self, target: str = "unclassified") -> None:
         with self._idle:
             self.active_connections = max(0, self.active_connections - 1)
+            target_counter = self._target_locked(target)
+            target_counter["activeConnections"] = max(
+                0,
+                target_counter["activeConnections"] - 1,
+            )
             self._idle.notify_all()
 
     def wait_for_idle(self, timeout: float) -> bool:
@@ -100,7 +124,11 @@ class TrafficCounters:
                 self._idle.wait(remaining)
             return True
 
-    def add_failure(self, exc: BaseException) -> None:
+    def add_failure(
+        self,
+        exc: BaseException,
+        target: str = "unclassified",
+    ) -> None:
         message = f"{type(exc).__name__}: {exc}"
         if self.upstream.username:
             message = message.replace(self.upstream.username, "<redacted>")
@@ -108,6 +136,7 @@ class TrafficCounters:
             message = message.replace(self.upstream.password, "<redacted>")
         with self._lock:
             self.failures += 1
+            self._target_locked(target)["failures"] += 1
             self.errors.append(message[:500])
             del self.errors[:-10]
 
@@ -119,9 +148,33 @@ class TrafficCounters:
             active_connections = int(self.active_connections)
             failures = int(self.failures)
             errors = list(self.errors)
+            targets = {
+                key: dict(value)
+                for key, value in self.targets.items()
+            }
             stopped = self.stopped_at
         total = upload + download
         ended = stopped or time.time()
+        target_rows = []
+        for target, value in targets.items():
+            target_upload = int(value.get("uploadBytes") or 0)
+            target_download = int(value.get("downloadBytes") or 0)
+            target_total = target_upload + target_download
+            target_rows.append(
+                {
+                    "target": target,
+                    "uploadBytes": target_upload,
+                    "downloadBytes": target_download,
+                    "totalBytes": target_total,
+                    "uploadMiB": round(target_upload / (1024 * 1024), 4),
+                    "downloadMiB": round(target_download / (1024 * 1024), 4),
+                    "totalMiB": round(target_total / (1024 * 1024), 4),
+                    "connections": int(value.get("connections") or 0),
+                    "activeConnections": int(value.get("activeConnections") or 0),
+                    "failures": int(value.get("failures") or 0),
+                }
+            )
+        target_rows.sort(key=lambda item: int(item["totalBytes"]), reverse=True)
         return {
             "enabled": True,
             "upstreamProxy": self.upstream.display,
@@ -136,6 +189,7 @@ class TrafficCounters:
             "activeConnections": active_connections,
             "failures": failures,
             "errors": errors,
+            "targets": target_rows,
             "durationSeconds": round(max(0.0, ended - self.started_at), 3),
             "measurement": (
                 "bytes read from and written to the upstream proxy socket; "
@@ -227,6 +281,11 @@ def _split_host_port(value: str, default_port: int) -> tuple[str, int]:
     return text, default_port
 
 
+def _format_target(host: str, port: int) -> str:
+    normalized_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return f"{normalized_host}:{int(port)}"
+
+
 class ProxyTrafficMeter:
     def __init__(
         self,
@@ -287,34 +346,54 @@ class ProxyTrafficMeter:
         raw.settimeout(None)
         return raw
 
-    def _send_upstream(self, sock: socket.socket, data: bytes) -> None:
+    def _send_upstream(
+        self,
+        sock: socket.socket,
+        data: bytes,
+        target: str = "unclassified",
+    ) -> None:
         if not data:
             return
         sock.sendall(data)
-        self.counters.add_upload(len(data))
+        self.counters.add_upload(len(data), target)
 
-    def _recv_upstream(self, sock: socket.socket, size: int = BUFFER_SIZE) -> bytes:
+    def _recv_upstream(
+        self,
+        sock: socket.socket,
+        size: int = BUFFER_SIZE,
+        target: str = "unclassified",
+    ) -> bytes:
         data = sock.recv(size)
-        self.counters.add_download(len(data))
+        self.counters.add_download(len(data), target)
         return data
 
-    def _recv_exact_upstream(self, sock: socket.socket, size: int) -> bytes:
+    def _recv_exact_upstream(
+        self,
+        sock: socket.socket,
+        size: int,
+        target: str = "unclassified",
+    ) -> bytes:
         chunks = bytearray()
         while len(chunks) < size:
-            chunk = self._recv_upstream(sock, size - len(chunks))
+            chunk = self._recv_upstream(sock, size - len(chunks), target)
             if not chunk:
                 raise ConnectionError("upstream proxy closed during handshake")
             chunks.extend(chunk)
         return bytes(chunks)
 
-    def _connect_socks_target(self, target_host: str, target_port: int) -> socket.socket:
+    def _connect_socks_target(
+        self,
+        target_host: str,
+        target_port: int,
+        target: str,
+    ) -> socket.socket:
         sock = socket.create_connection(
             (self.upstream.host, self.upstream.port),
             timeout=self.connect_timeout,
         )
         methods = b"\x02\x00" if self.upstream.username is not None else b"\x00"
-        self._send_upstream(sock, b"\x05" + bytes([len(methods)]) + methods)
-        selected = self._recv_exact_upstream(sock, 2)
+        self._send_upstream(sock, b"\x05" + bytes([len(methods)]) + methods, target)
+        selected = self._recv_exact_upstream(sock, 2, target)
         if selected[0] != 5 or selected[1] == 0xFF:
             raise ConnectionError(f"SOCKS5 authentication method rejected: {selected!r}")
         if selected[1] == 2:
@@ -325,8 +404,9 @@ class ProxyTrafficMeter:
             self._send_upstream(
                 sock,
                 b"\x01" + bytes([len(username)]) + username + bytes([len(password)]) + password,
+                target,
             )
-            auth_reply = self._recv_exact_upstream(sock, 2)
+            auth_reply = self._recv_exact_upstream(sock, 2, target)
             if auth_reply[1] != 0:
                 raise ConnectionError("SOCKS5 username/password authentication failed")
         elif selected[1] != 0:
@@ -344,23 +424,28 @@ class ProxyTrafficMeter:
         self._send_upstream(
             sock,
             b"\x05\x01\x00" + address_field + int(target_port).to_bytes(2, "big"),
+            target,
         )
-        reply = self._recv_exact_upstream(sock, 4)
+        reply = self._recv_exact_upstream(sock, 4, target)
         if reply[0] != 5 or reply[1] != 0:
             raise ConnectionError(f"SOCKS5 CONNECT failed with code {reply[1]}")
         address_size = {1: 4, 4: 16}.get(reply[3])
         if reply[3] == 3:
-            address_size = self._recv_exact_upstream(sock, 1)[0]
+            address_size = self._recv_exact_upstream(sock, 1, target)[0]
         if address_size is None:
             raise ConnectionError(f"invalid SOCKS5 reply address type: {reply[3]}")
-        self._recv_exact_upstream(sock, address_size + 2)
+        self._recv_exact_upstream(sock, address_size + 2, target)
         sock.settimeout(None)
         return sock
 
-    def _read_http_upstream_header(self, sock: socket.socket) -> bytes:
+    def _read_http_upstream_header(
+        self,
+        sock: socket.socket,
+        target: str,
+    ) -> bytes:
         data = bytearray()
         while b"\r\n\r\n" not in data:
-            chunk = self._recv_upstream(sock)
+            chunk = self._recv_upstream(sock, target=target)
             if not chunk:
                 break
             data.extend(chunk)
@@ -368,14 +453,19 @@ class ProxyTrafficMeter:
                 raise ValueError("upstream proxy response header exceeds limit")
         return bytes(data)
 
-    def _tunnel(self, client: socket.socket, upstream: socket.socket) -> None:
+    def _tunnel(
+        self,
+        client: socket.socket,
+        upstream: socket.socket,
+        target: str,
+    ) -> None:
         def upload() -> None:
             try:
                 while True:
                     data = client.recv(BUFFER_SIZE)
                     if not data:
                         break
-                    self._send_upstream(upstream, data)
+                    self._send_upstream(upstream, data, target)
             except OSError:
                 pass
             finally:
@@ -388,7 +478,7 @@ class ProxyTrafficMeter:
         thread.start()
         try:
             while True:
-                data = self._recv_upstream(upstream)
+                data = self._recv_upstream(upstream, target=target)
                 if not data:
                     break
                 client.sendall(data)
@@ -402,41 +492,59 @@ class ProxyTrafficMeter:
             thread.join(timeout=2.0)
 
     def handle_client(self, client: socket.socket) -> None:
-        self.counters.add_connection()
         upstream: Optional[socket.socket] = None
+        connection_target = "unclassified"
+        connection_started = False
         try:
             initial = _read_until_header(client)
             header, _ = _split_header(initial)
             method, target, _version = _request_line(header)
+            if method == "CONNECT":
+                target_host, target_port = _split_host_port(target, 443)
+            else:
+                _cleaned, target_host, target_port = _origin_form_request(initial)
+            connection_target = _format_target(target_host, target_port)
+            self.counters.add_connection(connection_target)
+            connection_started = True
             if self.upstream.scheme in {"http", "https"}:
                 upstream = self._connect_http_upstream()
                 forwarded = _inject_proxy_authorization(
                     initial, self.upstream.basic_authorization
                 )
-                self._send_upstream(upstream, forwarded)
+                self._send_upstream(upstream, forwarded, connection_target)
                 if method == "CONNECT":
-                    response = self._read_http_upstream_header(upstream)
+                    response = self._read_http_upstream_header(
+                        upstream,
+                        connection_target,
+                    )
                     client.sendall(response)
                     status_line = response.split(b"\r\n", 1)[0]
                     if b" 2" not in status_line:
                         return
-                self._tunnel(client, upstream)
+                self._tunnel(client, upstream, connection_target)
                 return
 
             if method == "CONNECT":
-                target_host, target_port = _split_host_port(target, 443)
-                upstream = self._connect_socks_target(target_host, target_port)
+                upstream = self._connect_socks_target(
+                    target_host,
+                    target_port,
+                    connection_target,
+                )
                 client.sendall(
                     b"HTTP/1.1 200 Connection Established\r\n"
                     b"Proxy-Agent: V4TrafficMeter\r\n\r\n"
                 )
             else:
                 initial, target_host, target_port = _origin_form_request(initial)
-                upstream = self._connect_socks_target(target_host, target_port)
-                self._send_upstream(upstream, initial)
-            self._tunnel(client, upstream)
+                upstream = self._connect_socks_target(
+                    target_host,
+                    target_port,
+                    connection_target,
+                )
+                self._send_upstream(upstream, initial, connection_target)
+            self._tunnel(client, upstream, connection_target)
         except Exception as exc:
-            self.counters.add_failure(exc)
+            self.counters.add_failure(exc, connection_target)
             try:
                 client.sendall(
                     b"HTTP/1.1 502 Bad Gateway\r\n"
@@ -450,7 +558,8 @@ class ProxyTrafficMeter:
                     upstream.close()
                 except OSError:
                     pass
-            self.counters.finish_connection()
+            if connection_started:
+                self.counters.finish_connection(connection_target)
 
 
 class _MeterServer(socketserver.ThreadingTCPServer):

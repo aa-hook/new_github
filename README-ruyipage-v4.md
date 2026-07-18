@@ -40,7 +40,9 @@ added as `proxyTrafficPhases` and splits the same measured bytes into:
 
 Counters include upstream proxy handshakes and tunneled TLS bytes, but not
 TCP/IP packet framing. `accountedBytes` and `unaccountedBytes` verify whether
-the three phase deltas cover the complete meter total.
+the three phase deltas cover the complete meter total. The `targets` array in
+`proxy_traffic.json` also groups bytes and connections by CONNECT destination;
+only `host:port` is recorded, never request paths, query values, or credentials.
 
 Also accepted by the script:
 
@@ -57,6 +59,9 @@ socks5://username:password@host:port
 - No IP or geography probe runs.
 - One lightweight GBR country probe runs before date-of-birth submission; this is required by the server-rendered flow.
 - RuyiPage starts after the HTTP flow reaches `captcha-gate` and closes immediately after obtaining the token.
+- Firefox Remote Settings, updates, telemetry, extension refresh, Safe Browsing
+  list refresh, prefetch, and speculative connections are disabled before the
+  RuyiPage process starts. Arkose and Battle.net page traffic remains enabled.
 - Browser fonts, media, and common analytics hosts are blocked; Arkose assets and challenge images remain enabled.
 - Per-wave screenshots are disabled unless `--debug-screenshots` is supplied.
 - V11 is loaded once per matrix job and reused across all challenge waves and retries.
